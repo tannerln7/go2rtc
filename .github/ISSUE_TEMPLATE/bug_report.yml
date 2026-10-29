@@ -1,0 +1,121 @@
+name: Bug report
+description: Report a reproducible problem with the Petlibro go2rtc integration
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve the Petlibro go2rtc integration. PLAF203 is
+        the primary tested device; other models may not yet be fully supported.
+
+        **Protect private and security-sensitive information.** Remove device
+        UIDs and serial numbers, MQTT credentials, passwords, tokens, secrets,
+        private keys, personally identifiable information, and publicly
+        sensitive network identifiers or addresses. Share only sanitized logs,
+        configuration, and traces. Do not publish working exploitation
+        procedures or device credentials.
+
+        For questions, uncertain root causes, and intermittent troubleshooting,
+        use the linked troubleshooting Discussion instead.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem description and actual behavior
+      description: Concisely describe what is wrong and what actually happens.
+      placeholder: The stream starts, then stalls after approximately two minutes...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen instead?
+      placeholder: The RTSP stream should continue without interruption.
+    validations:
+      required: true
+
+  - type: textarea
+    id: device
+    attributes:
+      label: Device and firmware
+      description: Include the Petlibro model, OEM firmware version, and hardware revision if known. Write "unknown" where needed.
+      placeholder: |
+        Model: PLAF203
+        OEM firmware: 1.2.3
+        Hardware revision: unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: go2rtc environment
+      description: Include the go2rtc release/tag or commit, installation method, OS/architecture, and relevant streaming consumer.
+      placeholder: |
+        go2rtc: v1.9.14-petlibro.3
+        Installation: Home Assistant add-on
+        OS/architecture: Home Assistant OS, amd64
+        Consumer: WebRTC in Home Assistant
+    validations:
+      required: true
+
+  - type: textarea
+    id: network
+    attributes:
+      label: Network environment
+      description: State whether the feeder and go2rtc are on the same subnet, and note Docker network mode, VLAN/routing, or Wi-Fi/MQTT reconnections that may be relevant. Write "unknown" where needed.
+      placeholder: |
+        Same subnet: yes
+        Container network: host
+        VLAN or routed path: none
+        Wi-Fi/MQTT disconnect or reconnect observed: unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps and conditions
+      description: List the smallest known steps and any timing, quality, audio, concurrent-viewer, or reconnection conditions needed to trigger the problem.
+      placeholder: |
+        1. Start the HD stream through RTSP.
+        2. Open a second WebRTC viewer.
+        3. Wait approximately two minutes.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: Frequency
+      description: How consistently can you reproduce the problem?
+      options:
+        - Every time
+        - Often
+        - Intermittently
+        - Once
+        - Unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics and supporting evidence
+      description: Add relevant go2rtc logs, FFprobe/FFmpeg output, sanitized configuration or packet-trace summaries, screenshots, and any change that improved or worsened the behavior. Advanced diagnostics are optional.
+      placeholder: Paste sanitized text in code blocks or drag screenshots here. Remove all sensitive values before submitting.
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing Issues and Discussions for the same report.
+          required: true
+        - label: I removed credentials, device identifiers, private network details, personal information, and other sensitive data.
+          required: true
+
