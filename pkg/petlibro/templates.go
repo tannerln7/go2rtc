@@ -56,32 +56,16 @@ var sdkVersion = []byte{0x00, 0x08, 0x03, 0x04}
 // starting, but matching the app's sequence avoids edge-case
 // firmware quirks on some camera models.
 const (
-	ioctlInnerSendDataDelay     uint32 = 0x00FF // IOTYPE_INNER_SND_DATA_DELAY
-	ioctlPetlibroStreamCtrl     uint32 = 0x0024 // captured Petlibro SETSTREAMCTRL body ID
-	ioctlPetlibroStreamCtrlResp uint32 = 0x0025 // captured Petlibro SETSTREAMCTRL response
-	ioctlPetlibroQueryResp      uint32 = 0x0040 // captured Petlibro camera-query response
-	ioctlSetStreamCtrlReq       uint32 = 0x0320 // standard IOTYPE_USER_IPCAM_SETSTREAMCTRL_REQ
-	ioctlSetStreamCtrlResp      uint32 = 0x0321
-	ioctlStart                  uint32 = 0x01FF // IOTYPE_USER_IPCAM_START
-	ioctlStop                   uint32 = 0x02FF // IOTYPE_USER_IPCAM_STOP
-	ioctlAudioOn                uint32 = 0x0300 // IOTYPE_USER_IPCAM_AUDIOSTART
-	ioctlGetStreamCtrlReq       uint32 = 0x0322 // IOTYPE_USER_IPCAM_GETSTREAMCTRL_REQ
-	ioctlGetStreamCtrlResp      uint32 = 0x0323
-	ioctlGetAudioOutFormatReq   uint32 = 0x032A // IOTYPE_USER_IPCAM_GETAUDIOOUTFORMAT_REQ
-	ioctlGetAudioOutFormatResp  uint32 = 0x032B // IOTYPE_USER_IPCAM_GETAUDIOOUTFORMAT_RESP
-	ioctlGetVideoModeReq        uint32 = 0x0372 // IOTYPE_USER_IPCAM_GET_VIDEOMODE_REQ
-)
-
-// SETSTREAMCTRL bodies (12 bytes) — IOCtrl 0x0024 wire payload.
-// Byte 4 selects which stream the body configures (0x01 = main /
-// HD, 0x02 = sub / SD); bytes 6..7 are a feature-flag bitmask.
-// Sending qualityHD enables HD; sending qualitySD enables SD.  The
-// camera will continue emitting whichever stream(s) it was last
-// told to enable; the HD/SD on/off state is sticky in the camera's
-// cloud config (set via the Petlibro app), not toggled per-session.
-var (
-	qualityHD = []byte{byte(ioctlPetlibroStreamCtrl), 0, 0, 0, 0x01, 0x00, 0xff, 0x3f, 0, 0, 0, 0}
-	qualitySD = []byte{byte(ioctlPetlibroStreamCtrl), 0, 0, 0, 0x02, 0x00, 0x8a, 0x81, 0, 0, 0, 0}
+	ioctlInnerSendDataDelay    uint32 = 0x00FF // IOTYPE_INNER_SND_DATA_DELAY
+	ioctlSetStreamCtrlReq      uint32 = 0x0320 // standard SDK ID; NOT a quality setter implemented by AF203
+	ioctlStart                 uint32 = 0x01FF // IOTYPE_USER_IPCAM_START
+	ioctlStop                  uint32 = 0x02FF // IOTYPE_USER_IPCAM_STOP
+	ioctlAudioOn               uint32 = 0x0300 // IOTYPE_USER_IPCAM_AUDIOSTART
+	ioctlGetStreamCtrlReq      uint32 = 0x0322 // IOTYPE_USER_IPCAM_GETSTREAMCTRL_REQ
+	ioctlGetStreamCtrlResp     uint32 = 0x0323
+	ioctlGetAudioOutFormatReq  uint32 = 0x032A // IOTYPE_USER_IPCAM_GETAUDIOOUTFORMAT_REQ
+	ioctlGetAudioOutFormatResp uint32 = 0x032B // IOTYPE_USER_IPCAM_GETAUDIOOUTFORMAT_RESP
+	ioctlGetVideoModeReq       uint32 = 0x0372 // IOTYPE_USER_IPCAM_GET_VIDEOMODE_REQ
 )
 
 // Inner media-family markers at offset 16 in the normal header (offset 24 in

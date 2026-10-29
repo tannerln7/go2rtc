@@ -202,8 +202,8 @@ func classifyC2D(body []byte) string {
 				return "ioctrl_ipcam_start_0x01ff"
 			case 0x02ff:
 				return "ioctrl_ipcam_stop_0x02ff"
-			case ioctlPetlibroStreamCtrl:
-				return "ioctrl_petlibro_streamctrl_0x0024"
+			case controlReceiveReset:
+				return "internal_receive_reset_0x0024"
 			case ioctlSetStreamCtrlReq:
 				return "ioctrl_setstreamctrl_req_0x0320"
 			case ioctlGetStreamCtrlReq:

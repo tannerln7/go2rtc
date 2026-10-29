@@ -94,17 +94,20 @@ func TestIOCtrlResponseTraceUsesPlainD2CBody(t *testing.T) {
 	c := &Client{sessionID: "ps-test", verbose: true}
 	inner := make([]byte, 48)
 	inner[0] = 0x0c
+	inner[2] = 11
+	inner[17] = 0x10
+	inner[20] = 1
 	binary.LittleEndian.PutUint16(inner[18:20], 2)
 	binary.LittleEndian.PutUint32(inner[24:28], 12)
-	binary.LittleEndian.PutUint32(inner[36:40], ioctlPetlibroStreamCtrlResp)
+	binary.LittleEndian.PutUint32(inner[36:40], controlReceiveResetDone)
 	inner[40] = 2
 	binary.LittleEndian.PutUint16(inner[42:44], 0x818a)
 
 	c.debugIOCtrlResponse(inner)
 	output := buffer.String()
-	if !strings.Contains(output, "petlibro IOCtrl response received") ||
-		!strings.Contains(output, `"ioctl":37`) ||
-		!strings.Contains(output, `"response_value":2173304834`) {
+	if !strings.Contains(output, "petlibro reliable response received") ||
+		!strings.Contains(output, `"opcode":37`) ||
+		!strings.Contains(output, `"family":4096`) {
 		t.Fatalf("plain IOCtrl response was not traced correctly:\n%s", output)
 	}
 	if strings.Contains(output, "818a") {

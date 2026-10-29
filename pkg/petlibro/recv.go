@@ -59,6 +59,7 @@ func (c *Client) handleEncryptedDatagram(raw []byte) {
 // can never acknowledge data that was not actually received.
 func (c *Client) initACKTracking(watermark uint64) {
 	c.ackMu.Lock()
+	c.ackEpoch++
 	c.ackPendingWarn = 32
 	c.ackReportedExt = watermark
 	c.ackWatermarkExt = watermark
@@ -189,6 +190,7 @@ func (c *Client) contiguousAckExt() uint64 {
 }
 
 type ackWindow struct {
+	epoch         uint64
 	baseExt       uint64
 	highExt       uint64
 	contiguousExt uint64
@@ -198,8 +200,8 @@ type ackWindow struct {
 
 // ackWindowLocked reports a complete description of (base, high]. Base is the
 // contiguous position advanced by the previous successful report, not the
-// current receive watermark. AF203 explicitly retires non-NACKed entries in
-// this interval, and its native builder likewise uses a prior receive position
+// current receive watermark. After its timing/reference guards AF203 retires
+// non-NACKed entries in this interval. Its builder likewise uses a prior position
 // at +8. Keeping the two positions separate ensures newly contiguous packets,
 // including a recovered hole, are positively acknowledged once.
 //
@@ -208,6 +210,7 @@ type ackWindow struct {
 // packet from its resend queue.
 func (c *Client) ackWindowLocked() ackWindow {
 	w := ackWindow{
+		epoch:   c.ackEpoch,
 		baseExt: c.ackReportedExt, highExt: c.ackHighExt,
 		contiguousExt: c.ackWatermarkExt, seenPending: c.ackSeenPending,
 	}
@@ -244,6 +247,10 @@ func (c *Client) ackWindowLocked() ackWindow {
 // and a receive hole cannot be skipped because ackWatermarkExt cannot cross it.
 func (c *Client) markTransportACKSent(w ackWindow) {
 	c.ackMu.Lock()
+	if w.epoch != c.ackEpoch {
+		c.ackMu.Unlock()
+		return
+	}
 	reported := w.contiguousExt
 	if reported > w.highExt {
 		reported = w.highExt
@@ -260,6 +267,44 @@ func (c *Client) nextTransportACK(ordinal, tick uint16) (transportACK, ackWindow
 	w := c.ackWindowLocked()
 	a := c.transportACKLocked(ordinal, uint16(w.baseExt), uint16(w.highExt), w.missing, tick)
 	return a, w
+}
+
+// New reliable delivery forces a prompt report. A media gap alone does not
+// bypass the native 100ms gate or become receipt because of elapsed time.
+func (c *Client) reportDue(now time.Time) bool {
+	return c.ackForce || now.Sub(c.ackLastSent) >= defaultACKInterval
+}
+
+// Bootstrap and runtime use the same report builder, commit rules and logging.
+func (c *Client) sendReceiveReport(now time.Time) error {
+	a, w := c.nextTransportACK(c.icounter, uint16(now.UnixMilli()))
+	if !c.avSequenceAnchored {
+		a.AVBase = 0xffff
+		a.AVHigh = 0xffff
+		a.Missing = nil
+	}
+	if c.verbose && c.traceACK {
+		log.Trace().Str("physical_session_id", c.sessionID).Uint16("ordinal", a.Ordinal).
+			Uint16("avBase", a.AVBase).Uint16("avHigh", a.AVHigh).
+			Uint64("ackReportedBaseExt", w.baseExt).Uint64("ackWatermarkExt", w.contiguousExt).
+			Uint64("avHighExt", w.highExt).Uint64("avNextExt", c.avNextObserved.Load()).
+			Uint64("ackSeenPending", w.seenPending).Interface("missingOffsets", a.Missing).
+			Uint16("reliableRecvACK", a.ReliableRecvACK).Uint16("sendCount", a.SendCount).
+			Uint16("tick16", a.Tick).Msg("petlibro transport ACK send")
+	}
+	c.icounter++
+	if err := c.sendInner(a.marshal()); err != nil {
+		return err
+	}
+	c.markTransportACKSent(w)
+	c.ackLastSent = now
+	c.ackForce = false
+	c.stats.ackPrevLow16.Store(uint64(a.AVBase))
+	c.stats.ackCurrentLow16.Store(uint64(a.AVHigh))
+	c.stats.ackNACKCount.Store(uint64(len(a.Missing)))
+	c.stats.ackSendCount.Store(uint64(a.SendCount))
+	c.stats.ackSent.Add(1)
+	return nil
 }
 
 func (c *Client) nextTransportACKForRange(ordinal, base, high uint16, missing []uint16, tick uint16) transportACK {
@@ -343,10 +388,8 @@ func (c *Client) recvLoop() {
 			// fall through to periodic work below
 		}
 
-		// Shorter forceDrain interval — the camera (over LAN) has
-		// usually retransmitted lost packets within ~50-100 ms or
-		// they're not coming at all.  Holding longer just adds
-		// rendering latency without recovering more data.
+		// Real-time assembly may move on before transport retry completes.
+		// This cadence is NOT a declaration that missing payload expired.
 		if time.Since(lastForce) > 100*time.Millisecond {
 			c.forceDrain()
 			lastForce = time.Now()
@@ -372,7 +415,7 @@ func (c *Client) readerGoroutine(out chan<- []byte) {
 		}
 		_ = c.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 		buf := make([]byte, 65535)
-		n, _, err := c.conn.ReadFromUDP(buf)
+		n, addr, err := c.conn.ReadFromUDP(buf)
 		if err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				c.stats.recvTimeouts.Add(1)
@@ -381,6 +424,9 @@ func (c *Client) readerGoroutine(out chan<- []byte) {
 			return
 		}
 		if n == 0 {
+			continue
+		}
+		if addr.Port != c.cam.Port || !addr.IP.Equal(c.cam.IP) {
 			continue
 		}
 		select {
@@ -551,10 +597,8 @@ func (c *Client) dumpStats() {
 // reports. Type 0x0a is a timing probe, not a periodic heartbeat; probes from
 // the camera are answered reactively by the inner-message dispatcher.
 func (c *Client) maintenanceLoop() {
-	tick16 := func() uint16 { return uint16(time.Now().UnixMilli() & 0xFFFF) }
-
 	alive := time.NewTicker(1500 * time.Millisecond)
-	ack := time.NewTicker(defaultACKInterval)
+	ack := time.NewTicker(20 * time.Millisecond)
 	defer alive.Stop()
 	defer ack.Stop()
 
@@ -572,38 +616,13 @@ func (c *Client) maintenanceLoop() {
 				return
 			default:
 			}
-			tick := tick16()
-			a, window := c.nextTransportACK(c.icounter, tick)
-			body := a.marshal()
-			if c.verbose && c.traceACK {
-				log.Trace().
-					Str("physical_session_id", c.sessionID).
-					Uint16("ordinal", a.Ordinal).
-					Uint16("avBase", a.AVBase).
-					Uint16("avHigh", a.AVHigh).
-					Uint64("ackReportedBaseExt", window.baseExt).
-					Uint64("ackWatermarkExt", window.contiguousExt).
-					Uint64("avHighExt", window.highExt).
-					Uint64("avNextExt", c.avNextObserved.Load()).
-					Uint64("ackSeenPending", window.seenPending).
-					Interface("missingOffsets", a.Missing).
-					Uint16("reliableRecvACK", a.ReliableRecvACK).
-					Uint16("sendCount", a.SendCount).
-					Uint16("tick16", tick).
-					Msg("petlibro transport ACK send")
+			now := time.Now()
+			_ = c.retryReliable(now)
+			if !c.reportDue(now) {
+				c.innerMu.Unlock()
+				continue
 			}
-			err := c.sendInner(body)
-			if err == nil {
-				c.markTransportACKSent(window)
-			}
-			c.icounter++
-			c.stats.ackPrevLow16.Store(uint64(a.AVBase))
-			c.stats.ackCurrentLow16.Store(uint64(a.AVHigh))
-			c.stats.ackNACKCount.Store(uint64(len(a.Missing)))
-			c.stats.ackSendCount.Store(uint64(a.SendCount))
-			if err == nil {
-				c.stats.ackSent.Add(1)
-			}
+			_ = c.sendReceiveReport(now)
 			c.innerMu.Unlock()
 		}
 	}

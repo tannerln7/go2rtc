@@ -82,7 +82,7 @@ separate option.
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `quality=hd` or `quality=sd` | `hd` | Selects the requested stream and builds the corresponding stream-control command |
+| `quality=hd` or `quality=sd` | `hd` | HD SPS stabilization preference, or immediate available-source readiness for SD; not a per-viewer OEM resolution setter |
 | `audio=true` | `false` | Requests AAC audio after video start |
 | `strict=1` | off | Drops damaged IDRs instead of emitting them; may freeze until a clean IDR. Dependent P-frames are always suppressed after a reference AU is dropped. |
 
@@ -92,7 +92,8 @@ generated URL. The renderer adds `audio=true` and a demand-driven
 go2rtc tracks; H.264 is not transcoded. This enables feeder-microphone audio
 only and does not implement the speaker/backchannel direction.
 
-The Petlibro stream-control body is capture-backed. The zero-valued data-delay
+The native receive-reset is correlated before START; it is not quality selection.
+See [protocol semantics](petlibro-transport.md). The zero-valued data-delay
 control follows the public TUTK AVAPI sequence and was the packaged add-on's
 validated default; the repository does not claim that every firmware requires
 it. Both are fixed in the supported production profile rather than exposed as

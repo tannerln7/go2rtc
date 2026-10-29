@@ -73,7 +73,7 @@ func TestCloseAfterStartTransmissionBeforeBootstrapCompletion(t *testing.T) {
 		frames: make(chan *Packet), done: make(chan struct{}),
 	}
 	start := bootstrapCmd{channelFamily: 0x7000, payload: ioctlBody12(ioctlStart), startsMedia: true}
-	if err := c.sendBootstrapCommand(start, 5); err != nil {
+	if err := c.sendBootstrapCommand(start); err != nil {
 		t.Fatal(err)
 	}
 	// Simulate any error after START but before bootstrap declares AV readiness.

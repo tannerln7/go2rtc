@@ -23,7 +23,9 @@ Run the Go commands below from the repository root.
 | [`pkg/petlibro/client.go`](../pkg/petlibro/client.go) | Transport state, addressing/diagnostic URL parsing, socket setup, counters, and plaintext C2D writes |
 | [`pkg/petlibro/camera.go`](../pkg/petlibro/camera.go) | PLAF203 lifecycle, codec readiness, SPS epochs, startup retry, and timestamp normalization |
 | [`pkg/petlibro/handshake.go`](../pkg/petlibro/handshake.go) | LAN discovery session handshake and login |
-| [`pkg/petlibro/bootstrap.go`](../pkg/petlibro/bootstrap.go) | IOCtrl ordering, stream control, AV-ready state, and initial sequence cursors |
+| [`pkg/petlibro/bootstrap.go`](../pkg/petlibro/bootstrap.go) | Correlated reset, IOCtrl ordering, and bootstrap/runtime receipt continuity |
+| [`pkg/petlibro/transport.go`](../pkg/petlibro/transport.go) | Shared envelope classifier, session/epoch validation, reliable clear/reset control |
+| [`pkg/petlibro/audio.go`](../pkg/petlibro/audio.go) | Fragmented AAC assembly and complete ADTS validation |
 | [`pkg/petlibro/recv.go`](../pkg/petlibro/recv.go) | Datagram receive loop, receive-side ACK tracking, maintenance ACKs, and stats |
 | [`pkg/petlibro/assembler.go`](../pkg/petlibro/assembler.go) | Media-header decoding, sequence reordering, frame assembly, loss accounting, and raw camera timestamps |
 | [`pkg/petlibro/producer.go`](../pkg/petlibro/producer.go) | Conventional conversion of normalized camera units to go2rtc media packets |
@@ -48,8 +50,11 @@ UDP datagram
 
 Preserve these boundaries when modifying the implementation:
 
-- `ackWatermarkExt` represents packets actually received contiguously on the
-  wire. It must not advance when the assembler skips a hole.
+The [native transport contract](petlibro-transport.md) records firmware evidence,
+reset/delivery semantics, ACK pacing and qualification limits.
+
+- `ackWatermarkExt` represents contiguous validated receipt or an explicit
+  peer-authorized discard floor. It must not advance when the assembler skips a hole.
 - `avNextExt` is the assembler output cursor. `forceDrain()` may advance it to
   preserve output liveness without changing the receive watermark.
 - ACK tracking happens after a media packet's real `subWire` is decoded and
@@ -67,17 +72,15 @@ Preserve these boundaries when modifying the implementation:
 - NACKed media may return on AF203's retransmission channels: audio `0x03`
   becomes `0x04`, key/IDR video `0x05` becomes `0x06`, and inter-frame video
   `0x07` becomes `0x08`. Classification normalizes only these verified pairs;
-  the packet must still pass its normal layout and payload checks before its
+  the packet must still pass transport bounds and canonical checksum before its
   sequence contributes to the receive ACK window.
 - Key/IDR-family video (`0x05`), inter-frame video (`0x07`), and audio (`0x03`)
   keep independent frame-assembly state.
-- Bootstrap usually reports AV sequence `0x3fff` before HD media begins at
-  `0x4000`, but hardware SD sessions have retained a later camera-global
-  sequence. When bootstrap has not observed media, the first runtime video
-  packet may establish that retained origin only when the jump exceeds the
-  complete NACK window. Audio arriving before that decision is not origin
-  evidence and is omitted until it can be projected safely; representable
-  initial video holes remain loss and are NACKed normally.
+- Bootstrap correlates native `0x24/0x25` receive-reset to establish boundary
+  `0x3fff`, for both readiness preferences. It preserves the actual receipt set,
+  including AAC and out-of-order media. No first-video origin heuristic or
+  capture-specific SD reset boundary is used. Runtime ACKs use the native 100 ms
+  gate with prompt reliable-control reports, never a hole-expiry policy.
 - The regular reorder drain cadence is 100 ms and the force-drain buffer
   threshold is 8 entries. Change either only as an isolated, measured
   experiment.
@@ -220,8 +223,9 @@ of build artifacts.
 For HD tests, record both the selected startup SPS and any later codec-change
 line. Repeated identical SPS units are intentionally TRACE-only.
 The adapter waits up to 15 seconds when an HD request begins below 1920x1080;
-the camera can transition later, so the first advertised resolution alone does
-not prove that stream control failed. This bound preserves the former packaged
+the camera can transition later; the first advertised resolution alone does
+not imply a reset failed: the transport reset does not select resolution.
+This bound preserves the former packaged
 add-on default; direct `petlibro://` sources previously defaulted to no wait.
 The bound limits startup latency and is a preference window, not a guarantee
 that the camera has reached its requested resolution. If video arrived after

@@ -27,15 +27,16 @@ const forceDrainStallTicks = 5 // ~500 ms with the 100 ms forceDrain cadence
 
 type pendingFrag struct {
 	channel byte
-	// isAudio: true for either AAC variant — ch=0x03 sub17=0x01 ADTS
-	// at offset 36, or ch=0x07 sub17=0x00 b1=0x0d with an 8-byte
-	// inner header before ADTS sync.
-	isAudio    bool
-	subExt     uint64
-	frameNum   uint32 // camera's per-channel frame counter (inner[28..31])
-	fragIdx    uint16 // index of fragment within frame (inner[22..23])
-	totalFrags uint16 // total fragments comprising this frame (inner[20]); widened from byte so >255-fragment IDRs at high bitrates don't silently truncate
-	payload    []byte
+	// Audio is channel 3 after retransmission normalization, independent of
+	// normal/timing envelope layout or whether this fragment starts with ADTS.
+	isAudio     bool
+	subExt      uint64
+	frameNum    uint32 // shared native media-frame group (normal inner[28..31])
+	fragIdx     uint16 // normalized index; the wire end field is metadata length
+	totalFrags  uint16 // total fragments comprising this frame (inner[20]); widened from byte so >255-fragment IDRs at high bitrates don't silently truncate
+	payload     []byte
+	isEnd       bool
+	metadataLen uint16
 }
 
 // channelAsm holds the assembly state for a single video channel.  The
@@ -309,135 +310,18 @@ func isExtendedMediaFamily(b1 byte) bool {
 // counter, not a "next frame" field: audio-enabled captures show it advancing
 // independently from the shared frame number at offset 36.
 func decodeExtendedMedia(inner []byte) (m decodedMedia, reason string, ok bool) {
-	if len(inner) >= 2 {
-		m.b1 = inner[1]
-	}
-	m.extended = true
-	if !isExtendedMediaFamily(m.b1) {
+	if len(inner) < 2 || inner[1]&8 == 0 {
 		return m, "not_extended_family", false
 	}
-	if len(inner) >= 28 {
-		m.subWire = binary.LittleEndian.Uint16(inner[26:28])
-	}
-	if len(inner) < 44 {
-		return m, "short_header", false
-	}
-
-	m.wireChannel = inner[24]
-	var channelOK bool
-	m.channel, m.retransmit, channelOK = normalizeMediaChannel(m.wireChannel)
-	m.subFlag = inner[25]
-	m.totalFrags = binary.LittleEndian.Uint16(inner[28:30])
-	m.fragIdx = binary.LittleEndian.Uint16(inner[30:32])
-	m.payloadLen = binary.LittleEndian.Uint16(inner[32:34])
-	m.frameNum = binary.LittleEndian.Uint32(inner[36:40])
-	m.mediaFrameNo = binary.LittleEndian.Uint32(inner[40:44])
-
-	if !channelOK {
-		return m, "invalid_channel", false
-	}
-	if m.totalFrags == 0 {
-		return m, "zero_total_frags", false
-	}
-	if m.payloadLen == 0 {
-		return m, "zero_payload", false
-	}
-	payloadEnd := 44 + int(m.payloadLen)
-	if payloadEnd > len(inner) {
-		return m, "payload_overflow", false
-	}
-	m.payload = inner[44:payloadEnd]
-	m.extraLen = len(inner) - payloadEnd
-	_, _, _, hasTrailer := stripFragmentMetadataTrailer(m.payload)
-	switch m.b1 {
-	case 0x08, 0x0c:
-		if m.channel == innerChAudio {
-			return m, "audio_data_family", false
-		}
-		if m.subFlag != 0 {
-			return m, "data_sub_flag", false
-		}
-		if m.fragIdx >= m.totalFrags {
-			return m, "data_frag_out_of_range", false
-		}
-		if hasTrailer {
-			return m, "data_has_frameinfo", false
-		}
-	case 0x09, 0x0d:
-		m.isEnd = true
-		if m.subFlag != 1 {
-			return m, "end_sub_flag", false
-		}
-		// Captured end fragments use the firmware's fixed marker value 16,
-		// even when totalFrags is 1 or much larger than 17.
-		if m.fragIdx != 16 {
-			return m, "end_frag_not_16", false
-		}
-		if m.channel == innerChAudio {
-			if m.totalFrags != 1 || len(m.payload) < 2 || m.payload[0] != 0xff || m.payload[1]&0xf6 != 0xf0 {
-				return m, "invalid_audio_payload", false
-			}
-			m.isAudio = true
-		} else if !hasTrailer {
-			return m, "end_missing_frameinfo", false
-		}
-	}
-	return m, "accepted", true
+	return decodeMediaEnvelope(inner)
 }
 
-func decodeNormalMedia(inner []byte) (m decodedMedia, ok bool) {
-	if len(inner) < 36 {
-		return m, false
+func decodeNormalMedia(inner []byte) (decodedMedia, bool) {
+	if len(inner) < 2 || inner[1]&8 != 0 {
+		return decodedMedia{}, false
 	}
-	m.b1 = inner[1]
-	m.wireChannel = inner[16]
-	var channelOK bool
-	m.channel, m.retransmit, channelOK = normalizeMediaChannel(m.wireChannel)
-	m.subFlag = inner[17]
-	m.subWire = binary.LittleEndian.Uint16(inner[18:20])
-	m.totalFrags = uint16(inner[20])
-	m.fragIdx = binary.LittleEndian.Uint16(inner[22:24])
-	m.payloadLen = binary.LittleEndian.Uint16(inner[24:26])
-	m.frameNum = binary.LittleEndian.Uint32(inner[28:32])
-	if !channelOK {
-		return m, false
-	}
-
-	payloadFrom := func(start int) []byte {
-		if m.payloadLen != 0 && start+int(m.payloadLen) <= len(inner) {
-			return inner[start : start+int(m.payloadLen)]
-		}
-		return inner[start:]
-	}
-	switch {
-	case (m.channel == innerChKey || m.channel == innerChInter) &&
-		(m.b1 == 0x00 || m.b1 == 0x04 || m.b1 == 0x05):
-		if m.payloadLen == 0 || 36+int(m.payloadLen) > len(inner) {
-			return m, false
-		}
-		m.payload = payloadFrom(36)
-	case (m.channel == innerChKey || m.channel == innerChInter) &&
-		m.b1 == 0x01 && m.subFlag == 0x01:
-		m.payload = payloadFrom(36)
-		m.isEnd = true
-	case m.channel == innerChAudio && m.subFlag == 0x01 &&
-		len(inner) >= 38 && inner[36] == 0xFF && inner[37] == 0xF1:
-		m.isAudio = true
-		m.payload = payloadFrom(36)
-	case m.channel == innerChInter && m.subFlag == 0x00 && m.b1 == 0x0d &&
-		len(inner) >= 46 && inner[44] == 0xFF && inner[45] == 0xF1:
-		m.isAudio = true
-		full := payloadFrom(36)
-		if len(full) > 8 {
-			m.payload = full[8:]
-		}
-	default:
-		return m, false
-	}
-	if m.isAudio && len(m.payload) == 0 {
-		return m, false
-	}
-	return m, true
+	m, _, ok := decodeMediaEnvelope(inner)
+	return m, ok
 }
 
 func (c *Client) traceExtendedMedia(m decodedMedia, accepted bool, reason string) {
@@ -463,49 +347,11 @@ func (c *Client) traceExtendedMedia(m decodedMedia, accepted bool, reason string
 		Msg("petlibro extendedMedia")
 }
 
-func decodeBootstrapMedia(inner []byte) (decodedMedia, bool) {
-	if len(inner) == 0 || inner[0] != 0x0c {
-		return decodedMedia{}, false
-	}
-	if isExtendedMediaFamily(inner[1]) {
-		if media, _, ok := decodeExtendedMedia(inner); ok {
-			return media, true
-		}
-	}
-	return decodeNormalMedia(inner)
-}
-
-// reliableControlSequence recognizes the IOCtrl/reliable family by its wire
-// structure rather than by sequence magnitude. Media and audio sequence
-// values legitimately cross the old 0x4000 heuristic.
+// reliableControlSequence is used by offline dump tools; production dispatch
+// and diagnostics use the same complete envelope classifier.
 func reliableControlSequence(inner []byte) (uint16, bool) {
-	if len(inner) < 20 || inner[0] != 0x0c || inner[1]&0x08 != 0 {
-		return 0, false
-	}
-
-	// AVAPI's reliable family appears in two Petlibro forms. Short transport
-	// control packets use a zero high byte and one of the observed family
-	// values below. IOCtrl responses retain the request's 0x1000/0x7000
-	// channel-family word and carry the normal 36-byte IOCtrl envelope. Media
-	// uses channel words 0x0003/0x0005/0x0007 instead, so checking the complete
-	// structure avoids the old and incorrect "sequence < 0x4000" heuristic.
-	channelFamily := binary.LittleEndian.Uint16(inner[16:18])
-	switch channelFamily {
-	case 0x0000, 0x2000, 0x2100, 0x7100, 0x7200:
-		return binary.LittleEndian.Uint16(inner[18:20]), true
-	case 0x1000, 0x7000:
-		// These are the IOCtrl channel families used by PLAF203.
-	default:
-		return 0, false
-	}
-	if len(inner) < 36 || inner[20] != 1 {
-		return 0, false
-	}
-	payloadLen := binary.LittleEndian.Uint32(inner[24:28])
-	if uint64(payloadLen) > uint64(len(inner)-36) {
-		return 0, false
-	}
-	return binary.LittleEndian.Uint16(inner[18:20]), true
+	f, ok := decodeReliable(inner)
+	return f.seq, ok
 }
 
 func timingProbeResponse(inner []byte) []byte {
@@ -537,87 +383,110 @@ func (c *Client) handleTransportControl(inner []byte) []byte {
 // crypto pass from the parser lets tests feed plaintext fixtures
 // straight in without re-encrypting; assembler_test.go relies on it.
 func (c *Client) parseDatagram(pkt []byte) {
-	if len(pkt) < 0x1C+1 || pkt[3] != flagsRecv {
+	c.innerMu.Lock()
+	defer c.innerMu.Unlock()
+	select {
+	case <-c.done:
+		return
+	default:
+	}
+	inner, ok := c.sessionInner(pkt)
+	if !ok {
 		return
 	}
-	if binary.LittleEndian.Uint16(pkt[8:]) != msgSessionD2C {
-		return
-	}
-	outerPayloadLen := int(binary.LittleEndian.Uint16(pkt[4:6]))
-	if outerPayloadLen <= 0x0c || outerPayloadLen-0x0c > len(pkt)-0x1c {
-		return
-	}
-	inner := pkt[0x1c : 0x1c+outerPayloadLen-0x0c]
 	switch inner[0] {
-	case 0x09, 0x0a, 0x0b:
-		if response := c.handleTransportControl(inner); response != nil {
+	case 9:
+		if len(inner) < 24 || len(inner) != max(24, 22+2*int(binary.LittleEndian.Uint16(inner[14:]))) {
+			return
+		}
+		c.acceptReliableACK(binary.LittleEndian.Uint16(inner[12:]))
+		c.handleTransportControl(inner)
+		return
+	case 10, 11:
+		if (inner[0] == 10 && len(inner) < 12) || (inner[0] == 11 && len(inner) < 20) {
+			return
+		}
+		if response := c.handleTransportControl(inner); response != nil && c.conn != nil {
 			if err := c.sendInner(response); err == nil {
 				c.stats.timingResponsesSent.Add(1)
 			}
 		}
 		return
-	case 0x0c:
+	case 12:
 	default:
 		return
 	}
-	if seq, ok := reliableControlSequence(inner); ok {
-		c.acceptReliableControl(seq)
+	if f, ok := decodeReliable(inner); ok {
 		c.debugIOCtrlResponse(inner)
+		c.receiveReliable(f)
 		c.stats.otherFrags.Add(1)
 		return
 	}
-	if len(inner) < 36 {
+	media, reason, ok := decodeMediaEnvelope(inner)
+	if len(inner) > 1 && inner[1]&8 != 0 {
+		c.stats.extendedMediaCandidates.Add(1)
+		if ok {
+			c.stats.extendedMediaParsed.Add(1)
+		} else {
+			c.stats.extendedMediaRejected.Add(1)
+		}
+		c.traceExtendedMedia(media, ok, reason)
+	}
+	if !ok {
+		if media.b1 == 8 {
+			c.stats.unknown0c08Remaining.Add(1)
+		}
+		if media.b1 == 13 {
+			c.stats.unknown0c0dRemaining.Add(1)
+		}
+		c.stats.sequenceSeenButUnhandled.Add(1)
+		c.stats.otherFrags.Add(1)
 		return
 	}
+	if c.reset.pending {
+		// A reset response may be reordered behind already-sent media. Preserve
+		// bounded actual receipt evidence, never ACK a maximum inferred from it.
+		if len(c.resetMediaPending) < 256 {
+			c.resetMediaPending = append(c.resetMediaPending, media)
+		}
+		return
+	}
+	c.acceptMedia(media)
+}
 
-	var media decodedMedia
-	if isExtendedMediaFamily(inner[1]) {
-		extended, reason, accepted := decodeExtendedMedia(inner)
-		if accepted {
-			media = extended
-			c.stats.extendedMediaCandidates.Add(1)
-			c.stats.extendedMediaParsed.Add(1)
-			if media.isEnd {
-				c.stats.extendedMediaEndPackets.Add(1)
-			} else {
-				c.stats.extendedMediaDataPackets.Add(1)
-			}
-			if media.b1 == 0x09 || media.b1 == 0x0c {
-				c.stats.extendedMediaRarePackets.Add(1)
-			}
-			c.traceExtendedMedia(media, true, reason)
-		} else if normal, normalOK := decodeNormalMedia(inner); normalOK {
-			// b1=0x0d is also used by the original-layout AAC variant.
-			// A valid normal packet wins over a failed extended candidate.
-			media = normal
-			c.stats.normalMediaPackets.Add(1)
-		} else {
-			c.stats.extendedMediaCandidates.Add(1)
-			c.stats.extendedMediaRejected.Add(1)
-			if len(inner) >= 28 {
-				c.stats.sequenceSeenButUnhandled.Add(1)
-			}
-			if extended.b1 == 0x08 {
-				c.stats.unknown0c08Remaining.Add(1)
-			} else if extended.b1 == 0x0d {
-				c.stats.unknown0c0dRemaining.Add(1)
-			}
-			c.stats.otherFrags.Add(1)
-			c.traceExtendedMedia(extended, false, reason)
-			return
-		}
-	} else {
-		normal, ok := decodeNormalMedia(inner)
-		if !ok {
-			return
-		}
-		media = normal
-		c.stats.normalMediaPackets.Add(1)
+func (c *Client) acceptMedia(media decodedMedia) {
+	if !c.avSequenceAnchored {
+		return
+	}
+	subExt, ok := c.wrap.extend(media.subWire)
+	if !ok || subExt <= c.avEpochFloor {
+		return
+	}
+	// A u16 position more than half a sequence space beyond an unresolved
+	// receive floor cannot be distinguished from an old retransmission. Do
+	// not advance the unwrap origin until receipt or explicit clear resolves
+	// that ambiguity; a later wrap must never fill an old hole by accident.
+	if floor := c.contiguousAckExt(); subExt > floor && subExt-floor >= 0x8000 {
+		return
+	}
+	if c.avFrameFloorSet && int32(media.frameNum-c.avFrameFloor) <= 0 {
+		return
 	}
 	if media.retransmit {
 		c.stats.mediaRetransmissions.Add(1)
 	}
-
+	if media.extended {
+		if media.isEnd {
+			c.stats.extendedMediaEndPackets.Add(1)
+		} else {
+			c.stats.extendedMediaDataPackets.Add(1)
+		}
+		if media.b1 == 9 || media.b1 == 12 {
+			c.stats.extendedMediaRarePackets.Add(1)
+		}
+	} else {
+		c.stats.normalMediaPackets.Add(1)
+	}
 	switch media.channel {
 	case innerChKey:
 		c.stats.keyFrags.Add(1)
@@ -625,90 +494,34 @@ func (c *Client) parseDatagram(pkt []byte) {
 		c.stats.interFrags.Add(1)
 	case innerChAudio:
 		c.stats.audioFrags.Add(1)
-	default:
-		c.stats.otherFrags.Add(1)
-	}
-	isVideo := !media.isAudio && (media.channel == innerChKey || media.channel == innerChInter)
-
-	// No filter by subWire — audio fragments legitimately arrive at
-	// wire values < 0x4000 alongside the high AV indices, and dropping
-	// those after video origin selection would silence the audio stream.
-	// The HD stream observed in official captures starts at 0x4000 after the
-	// bootstrap's 0x3fff AV-ready report. The physical PLAF203's SD path can
-	// instead retain a later camera-global AV counter. If bootstrap saw no AV
-	// media, treating that retained origin as thousands of missing packets
-	// permanently stalls the receive watermark and makes the camera repeatedly
-	// service NACKs for packets that never belonged to this session.
-	//
-	// Only video can establish this origin. AAC may arrive first and uses low
-	// sequence values, including an alternate layout carried on channel 0x07;
-	// interpreting it as retained video state would wrap the receive window.
-	// Anchor only a first-video jump larger than the complete NACK capacity.
-	// Smaller gaps remain ordinary loss/reordering and must still be reported;
-	// an origin actually observed during bootstrap is never rewritten.
-	// Before that origin is known, audio cannot be projected into the shared
-	// extended receive window safely. Ignore only these startup packets; video
-	// readiness precedes audio handoff and later AAC remains fully tracked.
-	if !c.avSequenceAnchored && !isVideo {
-		c.stats.sequenceSeenButUnhandled.Add(1)
-		return
-	}
-	if !c.avSequenceAnchored && isVideo {
-		c.avSequenceAnchored = true
-		forward := uint16(media.subWire - uint16(c.avNextExt))
-		if uint64(forward) > maxTransportNACKs {
-			firstExt := c.avNextExt + uint64(forward)
-			c.wrap = wrapSeq{ext: firstExt}
-			c.avNextExt = firstExt
-			c.avHighExt = firstExt - 1
-			c.avNextObserved.Store(firstExt)
-			c.initACKTracking(firstExt - 1)
-			if c.verbose {
-				log.Debug().Str("physical_session_id", c.sessionID).
-					Uint16("wire_sequence", media.subWire).Uint64("sequence_origin", firstExt).
-					Msg("petlibro runtime media established retained AV sequence origin")
-			}
-		}
-	}
-
-	subExt, ok := c.wrap.extend(media.subWire)
-	if !ok {
-		// Wire counter landed before the sequence start — most likely
-		// wire corruption.  Loud-drop instead of saturating to zero
-		// (which would have hashed into avBuffer at a slot
-		// drainContiguous can never reach since avNextExt starts at
-		// >=0x4000).
-		c.stats.otherFrags.Add(1)
-		c.stats.sequenceSeenButUnhandled.Add(1)
-		return
 	}
 	if subExt > c.avHighExt {
 		c.avHighExt = subExt
 		c.wrap.advanceTo(media.subWire)
 	}
-	// ACK receipt is tracked before assembler late/drop decisions. A
-	// retransmitted fragment that arrives after forceDrain advanced
-	// avNextExt is still real wire evidence and may close an ACK gap.
 	c.markACKReceived(subExt)
-	if subExt < c.avNextExt {
-		c.stats.deferredDrop.Add(1)
-		c.stats.sequenceSeenButUnhandled.Add(1)
-		return // late dup
-	}
 	if c.verbose && c.tracePackets {
-		log.Trace().Str("physical_session_id", c.sessionID).
-			Uint8("innerType", inner[0]).Uint8("b1", media.b1).Uint8("channel", media.channel).
-			Uint8("wireChannel", media.wireChannel).Bool("retransmit", media.retransmit).
-			Bool("extended", media.extended).
+		log.Trace().Str("physical_session_id", c.sessionID).Uint8("wireChannel", media.wireChannel).
+			Bool("retransmit", media.retransmit).Bool("extended", media.extended).
 			Uint16("subWire", media.subWire).Uint64("subExt", subExt).Uint32("frameNum", media.frameNum).
 			Uint16("fragIdx", media.fragIdx).Uint16("totalFrags", media.totalFrags).
 			Uint16("paylen", media.payloadLen).Msg("petlibro D2C media")
 	}
-	c.avBuffer[subExt] = &pendingFrag{
-		channel: media.channel, isAudio: media.isAudio,
-		subExt: subExt, frameNum: media.frameNum, fragIdx: media.fragIdx,
-		totalFrags: media.totalFrags, payload: media.payload,
+	if subExt < c.avNextExt {
+		c.stats.deferredDrop.Add(1)
+		return
 	}
+	if _, duplicate := c.avBuffer[subExt]; duplicate {
+		return
+	}
+	idx, metadata := media.fragIdx, uint16(0)
+	if media.isEnd {
+		idx = media.totalFrags - 1
+		metadata = media.fragIdx
+	}
+	c.avBuffer[subExt] = &pendingFrag{channel: media.channel, isAudio: media.isAudio,
+		subExt: subExt, frameNum: media.frameNum, fragIdx: idx, totalFrags: media.totalFrags,
+		payload: media.payload, isEnd: media.isEnd, metadataLen: metadata}
 	c.stats.sequenceSeenAndAssembled.Add(1)
 	c.drainContiguous()
 }
@@ -818,42 +631,16 @@ func (c *Client) forceDrain() {
 	}
 }
 
-// emit handles one in-order, fully-classified fragment.  Video frame
-// structure on the wire:
-//
-//   - 0..N-1 "data" fragments with b1 in {0x00, 0x04, 0x05}.  Slice
-//     bytes; paylen=1024 except possibly the last one; no trailer.
-//   - 1 final "end" fragment with b1=0x01 sub17=0x01, paylen smaller
-//     than 1024, ending in a 16-byte metadata trailer
-//     (codec_id 0x4e + 4-byte variant prefix + 7 zero bytes + 4-byte
-//     ms-ts). AF203 identifies FRAMEINFO byte 4 as onlineNum. SPS
-//     dimensions, not this count/state field, identify the resolution.
-//
-// The end fragment is identified by the trailer signature on its
-// payload tail, NOT by fragIdx (which can wrap when N>16 and reuse
-// "16" both as a data-fragment index and the end marker).  inner[20]
-// gives the camera's reported total fragment count, used as a
-// secondary sanity check for end-fragment detection and as the basis
-// for the "all data fragments lost" hard-floor in the end-fragment
-// path.
-//
-// CRITICAL: the camera time-multiplexes IDR fragments on ch=0x05 with
-// P-frame fragments on ch=0x07 in WIRE ORDER — e.g. mid-IDR a P-frame
-// can arrive.  Each channel MUST have its own assembly buffer or the
-// constant frame_num switching would drop every partial IDR.  Both
-// channels' completed frames are emitted into one PTS-ordered output
-// stream, since they share the camera's frame_num counter.
+// emit interprets a transport-valid fragment after AV ordering. End position
+// and metadata length come from the native header; a coincidental frame-info
+// suffix in data is not an end marker. Codec validation and GOP loss handling
+// below never change transport receipt.
 func (c *Client) emit(e *pendingFrag) {
 	if c.startedAt.IsZero() {
 		c.startedAt = time.Now()
 	}
 	if e.isAudio {
-		c.queuePacket(&Packet{
-			Codec:   CodecAACADTS,
-			Payload: e.payload,
-			FrameNo: c.emitAudioSeq,
-		})
-		c.emitAudioSeq++
+		c.emitAudio(e)
 		return
 	}
 	if e.channel != innerChKey && e.channel != innerChInter {
@@ -861,7 +648,21 @@ func (c *Client) emit(e *pendingFrag) {
 	}
 	c.stats.vidFrags.Add(1)
 
-	stripped, frameTs, onlineNum, hasTrailer := stripFragmentMetadataTrailer(e.payload)
+	stripped, frameTs, onlineNum, hasTrailer := e.payload, uint32(0), byte(0), false
+	if e.isEnd {
+		stripped = e.payload[:len(e.payload)-int(e.metadataLen)]
+		if e.metadataLen == 16 {
+			_, frameTs, onlineNum, hasTrailer = stripFragmentMetadataTrailer(e.payload)
+		}
+		// Unknown metadata is transport-valid, but not evidence of a usable
+		// H.264 access unit. Do not concatenate it into the next frame.
+		if e.metadataLen != 0 && !hasTrailer {
+			c.keyAsm.reset()
+			c.interAsm.reset()
+			c.gopPoisoned = true
+			return
+		}
+	}
 	c.debugAVFrameInfo(e, e.payload, hasTrailer)
 
 	asm := &c.keyAsm
@@ -913,6 +714,12 @@ func (c *Client) emit(e *pendingFrag) {
 		asm.curAUTotal = e.totalFrags
 		asm.receivedData = make(map[uint16]struct{})
 	}
+	if asm.curAUTotal != e.totalFrags || len(asm.buf)+len(e.payload) > maxMediaFragments*1024 {
+		asm.reset()
+		c.gopPoisoned = true
+		c.stats.vidDropped.Add(1)
+		return
+	}
 	if asm.curAUTotal == 0 && e.totalFrags != 0 {
 		asm.curAUTotal = e.totalFrags
 	}
@@ -923,10 +730,9 @@ func (c *Client) emit(e *pendingFrag) {
 		c.flushPendingIDR(frameTs)
 	}
 
-	if !hasTrailer {
-		// Data fragment.  fragIdx==16 is exempt from gap-detection
-		// because the camera reuses it as a position index when N>16.
-		if e.fragIdx != asm.expectFragIdx && e.fragIdx != 16 {
+	if !e.isEnd {
+		// Data-fragment indices are ordinary u16 values, including 16.
+		if e.fragIdx != asm.expectFragIdx {
 			c.stats.fragSkips.Add(1)
 			c.stats.fragIdxGap.Add(1)
 			if e.fragIdx > asm.expectFragIdx {
@@ -962,7 +768,7 @@ func (c *Client) emit(e *pendingFrag) {
 		isKeyframe := e.channel == innerChKey
 		c.debugFrameEvent("expected_data_shortfall", e, asm, onlineNum, hasTrailer, &isKeyframe)
 	}
-	trailerBytes := e.payload[len(e.payload)-16:]
+	trailerBytes := e.payload[len(e.payload)-int(e.metadataLen):]
 	c.logAVLoss(asm, e.channel, true, trailerBytes, asm.buf)
 
 	// Hard floor: if we got the end-fragment but ZERO data fragments

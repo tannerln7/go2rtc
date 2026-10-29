@@ -8,10 +8,10 @@ import (
 
 func TestBootstrapIOCtrlOrder(t *testing.T) {
 	wantIDs := []uint32{
-		ioctlPetlibroStreamCtrl, ioctlGetVideoModeReq, ioctlGetStreamCtrlReq,
+		ioctlGetVideoModeReq, ioctlGetStreamCtrlReq,
 		ioctlGetAudioOutFormatReq, ioctlInnerSendDataDelay, ioctlStart,
 	}
-	cmds := (&Client{}).bootstrapIOCtrls(qualityHD)
+	cmds := (&Client{}).bootstrapIOCtrls()
 	if len(cmds) != len(wantIDs) {
 		t.Fatalf("got %d commands, want %d", len(cmds), len(wantIDs))
 	}
@@ -23,7 +23,7 @@ func TestBootstrapIOCtrlOrder(t *testing.T) {
 }
 
 func TestBootstrapAudioStartsAfterVideo(t *testing.T) {
-	cmds := (&Client{audio: true}).bootstrapIOCtrls(qualityHD)
+	cmds := (&Client{audio: true}).bootstrapIOCtrls()
 	if len(cmds) < 2 {
 		t.Fatalf("audio bootstrap has %d commands", len(cmds))
 	}
@@ -40,7 +40,7 @@ func TestBootstrapAudioStartsAfterVideo(t *testing.T) {
 }
 
 func TestBootstrapAVAPIPayloadShapes(t *testing.T) {
-	cmds := (&Client{}).bootstrapIOCtrls(qualityHD)
+	cmds := (&Client{}).bootstrapIOCtrls()
 
 	delay := cmds[len(cmds)-2].payload
 	if len(delay) != 6 || binary.LittleEndian.Uint32(delay) != ioctlInnerSendDataDelay ||
@@ -57,31 +57,17 @@ func TestBootstrapAVAPIPayloadShapes(t *testing.T) {
 	}
 }
 
-func TestBootstrapUsesCapturedStreamControl(t *testing.T) {
-	cmds := (&Client{}).bootstrapIOCtrls(qualityHD)
-	if got := cmds[0].channelFamily; got != 0x1000 {
-		t.Fatalf("SETSTREAMCTRL channel=0x%04x, want captured 0x1000", got)
+// The captured bodies formerly called HD and SD both reset AV sequencing.
+func TestReceiveResetBodyFields(t *testing.T) {
+	body := controlBody(controlReceiveReset, 1, 0x3fff, 0)
+	want := []byte{0x24, 0, 0, 0, 1, 0, 0xff, 0x3f, 0, 0, 0, 0}
+	if !bytes.Equal(body, want) {
+		t.Fatalf("reset=%x want=%x", body, want)
 	}
-	if !bytes.Equal(cmds[0].payload, qualityHD) {
-		t.Fatalf("SETSTREAMCTRL=% x, want captured body % x", cmds[0].payload, qualityHD)
-	}
-}
-
-func TestStreamControlForRequestedQuality(t *testing.T) {
-	for _, test := range []struct {
-		quality string
-		want    []byte
-	}{
-		{quality: "hd", want: qualityHD},
-		{quality: "sd", want: qualitySD},
-	} {
-		got := streamControlForQuality(test.quality)
-		if !bytes.Equal(got, test.want) {
-			t.Errorf("quality %q body=% x, want % x", test.quality, got, test.want)
-		}
-		got[0] ^= 0xff
-		if bytes.Equal(got, test.want) {
-			t.Errorf("quality %q returned shared template storage", test.quality)
+	for _, quality := range []string{"hd", "sd"} {
+		cmds := (&Client{quality: quality}).bootstrapIOCtrls()
+		if cmds[0].channelFamily != applicationFamily || binary.LittleEndian.Uint32(cmds[0].payload) != ioctlGetVideoModeReq {
+			t.Fatal("quality must not choose a reset boundary")
 		}
 	}
 }

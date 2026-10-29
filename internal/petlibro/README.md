@@ -28,7 +28,7 @@ Core options:
 | URL host | no | discovery | Fixed camera address; UDP port defaults to `32761` |
 | `uid` | yes | — | Exact 20-character camera UID |
 | `subnet` | no | local broadcast | Additional IPv4 CIDR used for discovery; may be repeated |
-| `quality` | no | `hd` | Requests and selects `hd` or `sd` video |
+| `quality` | no | `hd` | `hd` waits for HD SPS stabilization; `sd` uses the available stream without that wait. Does not force OEM resolution. |
 | `audio` | no | `false` | Requests AAC audio when `true` or `1` |
 | `strict` | no | `false` | Drops damaged IDRs instead of emitting them; reference-P continuity recovery applies in either mode |
 | `verbose` | no | `false` | Enables compact bootstrap, readiness, codec, and health diagnostics |
@@ -47,8 +47,12 @@ host networking.
 
 ## Quality and codec probe
 
-The transport sends the captured Petlibro stream-control body for the requested
-quality before `IPCAM_START`, followed by the standard AVAPI pacing control.
+The transport completes a correlated native receive-reset before application
+queries, the standard AVAPI pacing control and `IPCAM_START`. The former
+captured "quality" bodies were reset requests, not resolution setters. OEM
+application configuration and queue occupancy select the physical feed; this
+firmware has no verified per-viewer quality setter. See the
+[transport contract](../../docs/petlibro-transport.md).
 Resolution is learned from H.264 SPS; FRAMEINFO `onlineNum` is an AV-client
 count/state and is never used as a stream selector.
 
@@ -79,8 +83,8 @@ key/IDR, inter/P, and audio families retain independent frame state; these
 labels describe packet behavior rather than official SDK terminology.
 
 Receive ACK state is independent from the assembler output cursor. The
-contiguous ACK watermark advances only for wire sequences actually received;
-force-draining an assembler hole does not acknowledge that missing packet.
+contiguous ACK watermark advances for validated receipt or explicit peer-authorized
+discard, not codec acceptance. Force-draining never acknowledges a missing packet.
 Positions above a hole are compressed into a capped set of consecutive ranges,
 preventing a single permanent gap from growing memory once per received packet.
 

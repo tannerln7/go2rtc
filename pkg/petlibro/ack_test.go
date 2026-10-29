@@ -35,7 +35,8 @@ func ackFor(t *testing.T, c *Client) (transportACK, ackWindow) {
 }
 
 // retireAF203Pending models the type 0x09 receive loop in FUN_003b5374:
-// every non-NACKed entry in (base, high] is removed from the sender queues.
+// Only AFTER its high-node/reference guard, non-NACKed entries are removed.
+// native_sender_test.go models those guards, prefix cleanup and timed retries.
 func retireAF203Pending(pending map[uint64]bool, baseExt uint64, a transportACK) {
 	missing := make(map[uint16]bool, len(a.Missing))
 	for _, offset := range a.Missing {
@@ -252,12 +253,13 @@ func TestTimingProbeResponse(t *testing.T) {
 func TestParseShortTransportPacket(t *testing.T) {
 	c := newTestClient(0x4000, "hd")
 	pkt := make([]byte, 0x1c+4)
+	copy(pkt[:3], []byte{4, 2, magicVersion})
 	pkt[3] = flagsRecv
 	binary.LittleEndian.PutUint16(pkt[4:], 0x0c+4)
 	binary.LittleEndian.PutUint16(pkt[8:], msgSessionD2C)
 	pkt[0x1c] = 0x09
 	c.parseDatagram(pkt)
-	if got := c.stats.transportACKReceived.Load(); got != 1 {
+	if got := c.stats.transportACKReceived.Load(); got != 0 {
 		t.Fatalf("transport ACK packets=%d", got)
 	}
 }
@@ -265,6 +267,7 @@ func TestParseShortTransportPacket(t *testing.T) {
 func TestParseSessionPacketWithoutInnerBody(t *testing.T) {
 	c := newTestClient(0x4000, "hd")
 	pkt := make([]byte, 0x1c+1)
+	copy(pkt[:3], []byte{4, 2, magicVersion})
 	pkt[3] = flagsRecv
 	binary.LittleEndian.PutUint16(pkt[4:], 0x0c)
 	binary.LittleEndian.PutUint16(pkt[8:], msgSessionD2C)
@@ -291,6 +294,7 @@ func TestParseTimingProbeSendsFeedback(t *testing.T) {
 	probe[0], probe[1] = 0x0a, 0x08
 	binary.LittleEndian.PutUint16(probe[8:], 0xcdef)
 	pkt := make([]byte, 0x1c+len(probe))
+	copy(pkt[:3], []byte{4, 2, magicVersion})
 	pkt[3] = flagsRecv
 	binary.LittleEndian.PutUint16(pkt[4:], uint16(0x0c+len(probe)))
 	binary.LittleEndian.PutUint16(pkt[8:], msgSessionD2C)
@@ -322,8 +326,8 @@ func TestReliableControlClassification(t *testing.T) {
 	inner := make([]byte, 36)
 	inner[0], inner[16], inner[17] = 0x0c, 0, 0x20
 	binary.LittleEndian.PutUint16(inner[18:], 0x2345)
-	if seq, ok := reliableControlSequence(inner); !ok || seq != 0x2345 {
-		t.Fatalf("reliable classification=%04x,%t", seq, ok)
+	if _, ok := reliableControlSequence(inner); ok {
+		t.Fatal("incomplete handshake envelope classified as reliable data")
 	}
 	inner[16] = innerChAudio
 	if _, ok := reliableControlSequence(inner); ok {
@@ -332,6 +336,7 @@ func TestReliableControlClassification(t *testing.T) {
 
 	ioctrl := make([]byte, 40)
 	ioctrl[0], ioctrl[16], ioctrl[17], ioctrl[20] = 0x0c, 0, 0x70, 1
+	ioctrl[2] = 11
 	binary.LittleEndian.PutUint16(ioctrl[18:], 0x4567)
 	binary.LittleEndian.PutUint32(ioctrl[24:], 4)
 	if seq, ok := reliableControlSequence(ioctrl); !ok || seq != 0x4567 {

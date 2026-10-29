@@ -244,7 +244,7 @@ type fragSpec struct {
 	sub17      byte   // inner[17]
 	b1         byte   // inner[1]
 	subWire    uint16 // inner[18:20]: AV-sequence (the wrap-counter)
-	totalFrags byte   // inner[20]
+	totalFrags uint16 // inner[20:22]
 	fragIdx    uint16 // inner[22:24]
 	paylen     uint16 // inner[24:26]: real payload length (0 = "rest of buf")
 	frameNum   uint32 // inner[28:32]: camera's frame counter for this channel
@@ -271,16 +271,28 @@ func makePkt(f fragSpec) []byte {
 	inner := make([]byte, 36+len(f.payload))
 	inner[0] = 0x0c
 	inner[1] = f.b1
+	inner[2] = 11
+	if _, _, _, trailer := stripFragmentMetadataTrailer(f.payload); trailer {
+		inner[1] |= 1
+		f.sub17 = 1
+		f.fragIdx = 16
+	} else if f.totalFrags == 1 && f.b1&^byte(13) == 0 && f.sub17 == 0 {
+		inner[1] |= 1
+		f.sub17 = 1
+		f.fragIdx = 0
+	}
 	inner[16] = f.channel
 	inner[17] = f.sub17
 	binary.LittleEndian.PutUint16(inner[18:], f.subWire)
-	inner[20] = f.totalFrags
+	binary.LittleEndian.PutUint16(inner[20:], f.totalFrags)
 	binary.LittleEndian.PutUint16(inner[22:], f.fragIdx)
 	binary.LittleEndian.PutUint16(inner[24:], f.paylen)
 	binary.LittleEndian.PutUint32(inner[28:], f.frameNum)
 	copy(inner[36:], f.payload)
+	fixtureMediaChecksum(inner, 16)
 
 	pkt := make([]byte, 0x1C+len(inner))
+	copy(pkt[:3], []byte{4, 2, magicVersion})
 	pkt[3] = flagsRecv
 	binary.LittleEndian.PutUint16(pkt[4:], uint16(0x0c+len(inner)))
 	binary.LittleEndian.PutUint16(pkt[8:], msgSessionD2C)
@@ -304,7 +316,9 @@ func makeCapturedNormalPkt(t *testing.T, headerHex string, payload []byte) []byt
 		t.Fatalf("capture header payload length=%d, fixture payload=%d", got, len(payload))
 	}
 	inner := append(header, payload...)
+	fixtureMediaChecksum(inner, 16) // sanitized payload requires a new checksum
 	pkt := make([]byte, 0x1c+len(inner))
+	copy(pkt[:3], []byte{4, 2, magicVersion})
 	pkt[3] = flagsRecv
 	binary.LittleEndian.PutUint16(pkt[4:], uint16(0x0c+len(inner)))
 	binary.LittleEndian.PutUint16(pkt[8:], msgSessionD2C)
@@ -339,6 +353,7 @@ func makeExtendedPkt(f extendedFragSpec) []byte {
 	inner := make([]byte, 44+len(f.payload)+len(f.extra))
 	inner[0] = 0x0c
 	inner[1] = f.b1
+	inner[2] = 11
 	inner[24] = f.channel
 	inner[25] = f.subFlag
 	binary.LittleEndian.PutUint16(inner[26:28], f.subWire)
@@ -349,8 +364,10 @@ func makeExtendedPkt(f extendedFragSpec) []byte {
 	binary.LittleEndian.PutUint32(inner[40:44], f.mediaFrameNo)
 	copy(inner[44:], f.payload)
 	copy(inner[44+len(f.payload):], f.extra)
+	fixtureMediaChecksum(inner, 24)
 
 	pkt := make([]byte, 0x1C+len(inner))
+	copy(pkt[:3], []byte{4, 2, magicVersion})
 	pkt[3] = flagsRecv
 	binary.LittleEndian.PutUint16(pkt[4:], uint16(0x0c+len(inner)))
 	binary.LittleEndian.PutUint16(pkt[8:], msgSessionD2C)
@@ -365,6 +382,7 @@ func makeExtendedPkt(f extendedFragSpec) []byte {
 // expected AV-seq value.
 func newTestClient(firstSubWire uint16, quality string) *Client {
 	c := &Client{
+		nonce:    make([]byte, 8),
 		quality:  quality,
 		frames:   make(chan *Packet, 256),
 		avBuffer: make(map[uint64]*pendingFrag),
@@ -377,119 +395,13 @@ func newTestClient(firstSubWire uint16, quality string) *Client {
 	c.avNextExt = c.wrap.ext
 	c.avHighExt = c.wrap.ext - 1
 	c.avSequenceAnchored = true
+	c.avEpochFloor = c.wrap.ext - 1
 	c.initACKTracking(c.wrap.ext - 1)
 	return c
 }
 
-func TestFirstRuntimeMediaAnchorsRetainedSDSequenceOrigin(t *testing.T) {
-	c := newTestClient(0x4000, "sd")
-	c.avSequenceAnchored = false // bootstrap observed no media beyond 0x3fff
-
-	payload := append([]byte{0, 0, 0, 1, 0x65, 0x88}, make([]byte, 16)...)
-	payload = makeTrailerPayload(payload, true, 0x01, 1000)
-	c.parseDatagram(makePkt(fragSpec{
-		channel: innerChKey, sub17: 0x01, subWire: 0x818b,
-		totalFrags: 1, fragIdx: 0, paylen: uint16(len(payload)), frameNum: 1,
-		payload: payload,
-	}))
-
-	const first = uint64(0x818b)
-	if got := c.contiguousAckExt(); got != first {
-		t.Fatalf("ACK watermark=0x%x, want retained origin 0x%x", got, first)
-	}
-	if got := c.stats.ackSeenPending.Load(); got != 0 {
-		t.Fatalf("ACK pending=%d, want 0 after origin anchor", got)
-	}
-	a, _ := ackFor(t, c)
-	if a.AVBase != uint16(first-1) || a.AVHigh != uint16(first) || len(a.Missing) != 0 {
-		t.Fatalf("anchored ACK=%+v, want base/high 0x818a/0x818b without NACKs", a)
-	}
-}
-
-func TestFirstRuntimeMediaOriginContinuesAcrossWireWrap(t *testing.T) {
-	c := newTestClient(0x4000, "sd")
-	c.avSequenceAnchored = false // bootstrap observed no media beyond 0x3fff
-
-	idr := makeTrailerPayload([]byte{0, 0, 0, 1, 0x65, 0x88}, true, 1, 1000)
-	c.parseDatagram(makePkt(fragSpec{
-		channel: innerChKey, sub17: 0x01, subWire: 0xfffe,
-		totalFrags: 1, fragIdx: 0, paylen: uint16(len(idr)), frameNum: 1,
-		payload: idr,
-	}))
-	inter := makeTrailerPayload([]byte{0, 0, 0, 1, 0x61, 0x99}, false, 1, 1040)
-	for i, wire := range []uint16{0xffff, 0x0000} {
-		c.parseDatagram(makePkt(fragSpec{
-			channel: innerChInter, sub17: 0x01, subWire: wire,
-			totalFrags: 1, fragIdx: 0, paylen: uint16(len(inter)), frameNum: uint32(i + 2),
-			payload: inter,
-		}))
-	}
-
-	if got := c.contiguousAckExt(); got != 0x10000 {
-		t.Fatalf("ACK watermark=0x%x, want wrapped extended sequence 0x10000", got)
-	}
-	a, _ := ackFor(t, c)
-	if a.AVBase != 0xfffd || a.AVHigh != 0 || len(a.Missing) != 0 {
-		t.Fatalf("wrapped retained-origin ACK=%+v, want base/high 0xfffd/0 without NACKs", a)
-	}
-}
-
-func TestAudioBeforeVideoDoesNotAnchorRetainedSDSequenceOrigin(t *testing.T) {
-	c := newTestClient(0x4000, "sd")
-	c.avSequenceAnchored = false // bootstrap observed no media beyond 0x3fff
-
-	// Audio has its own low wire values and may arrive before video. It is not
-	// evidence for where this session's video AV sequence begins.
-	audio := []byte{0xff, 0xf1, 0x50, 0x80, 0x01, 0x7f, 0xfc}
-	c.parseDatagram(makePkt(fragSpec{
-		channel: innerChAudio, sub17: 0x01, subWire: 0x0005,
-		totalFrags: 1, fragIdx: 0, paylen: uint16(len(audio)), frameNum: 1,
-		payload: audio,
-	}))
-	if c.avSequenceAnchored {
-		t.Fatal("audio packet incorrectly established the video AV sequence origin")
-	}
-	if got := c.avNextExt; got != 0x4000 {
-		t.Fatalf("audio moved assembler origin to 0x%x, want 0x4000", got)
-	}
-	if got := c.avHighExt; got != 0x3fff {
-		t.Fatalf("audio moved receive high-water to 0x%x, want 0x3fff", got)
-	}
-	if len(c.avBuffer) != 0 {
-		t.Fatalf("pre-origin audio entered reorder buffer: %d packets", len(c.avBuffer))
-	}
-	// The alternate AAC layout uses the inter-frame channel marker, so channel
-	// identity alone is insufficient to decide that a packet is video.
-	alternateAudio := append(make([]byte, 8), audio...)
-	c.parseDatagram(makePkt(fragSpec{
-		channel: innerChInter, b1: 0x0d, sub17: 0x00, subWire: 0x0006,
-		totalFrags: 1, fragIdx: 0, paylen: uint16(len(alternateAudio)), frameNum: 2,
-		payload: alternateAudio,
-	}))
-	if c.avSequenceAnchored {
-		t.Fatal("alternate-layout audio incorrectly established the video AV sequence origin")
-	}
-	if got := c.contiguousAckExt(); got != 0x3fff {
-		t.Fatalf("pre-origin audio moved ACK watermark to 0x%x, want 0x3fff", got)
-	}
-
-	video := makeTrailerPayload([]byte{0, 0, 0, 1, 0x65, 0x88}, true, 1, 1000)
-	c.parseDatagram(makePkt(fragSpec{
-		channel: innerChKey, sub17: 0x01, subWire: 0x818b,
-		totalFrags: 1, fragIdx: 0, paylen: uint16(len(video)), frameNum: 1,
-		payload: video,
-	}))
-	if !c.avSequenceAnchored {
-		t.Fatal("first video packet did not establish the AV sequence origin")
-	}
-	if got := c.contiguousAckExt(); got != 0x818b {
-		t.Fatalf("ACK watermark=0x%x, want retained video origin 0x818b", got)
-	}
-}
-
 func TestFirstRuntimeMediaPreservesRepresentableInitialLoss(t *testing.T) {
 	c := newTestClient(0x4000, "sd")
-	c.avSequenceAnchored = false // bootstrap observed no media beyond 0x3fff
 
 	payload := append([]byte{0, 0, 0, 1, 0x41, 0x88}, make([]byte, 16)...)
 	payload = makeTrailerPayload(payload, false, 0x01, 1000)
@@ -566,19 +478,19 @@ func TestGappedReferencePFrameSuppressesGOPUntilIDR(t *testing.T) {
 
 	// Establish a clean GOP, then discard its queued head so the assertions
 	// below cover only the loss/recovery sequence.
-	c.emit(&pendingFrag{channel: innerChKey, frameNum: 1, totalFrags: 1,
+	fixtureEmit(c, &pendingFrag{channel: innerChKey, frameNum: 1, totalFrags: 1,
 		payload: makeTrailerPayload(idr, true, 1, 1000)})
 	_ = drainAll(c)
 
 	// A fragment-index gap makes frame 2 incomplete. It must not be emitted,
 	// and frame 3 is dependent on that missing reference picture.
-	c.emit(&pendingFrag{channel: innerChInter, frameNum: 2, totalFrags: 3,
+	fixtureEmit(c, &pendingFrag{channel: innerChInter, frameNum: 2, totalFrags: 3,
 		fragIdx: 0, payload: inter})
-	c.emit(&pendingFrag{channel: innerChInter, frameNum: 2, totalFrags: 3,
+	fixtureEmit(c, &pendingFrag{channel: innerChInter, frameNum: 2, totalFrags: 3,
 		fragIdx: 2, payload: []byte{0xaa, 0xbb}})
-	c.emit(&pendingFrag{channel: innerChInter, frameNum: 2, totalFrags: 3,
+	fixtureEmit(c, &pendingFrag{channel: innerChInter, frameNum: 2, totalFrags: 3,
 		fragIdx: 3, payload: makeTrailerPayload([]byte{0xcc}, false, 1, 1040)})
-	c.emit(&pendingFrag{channel: innerChInter, frameNum: 3, totalFrags: 1,
+	fixtureEmit(c, &pendingFrag{channel: innerChInter, frameNum: 3, totalFrags: 1,
 		payload: makeTrailerPayload(inter, false, 1, 1080)})
 	if got := drainAll(c); len(got) != 0 {
 		t.Fatalf("forwarded %d P-frames after a gapped reference picture", len(got))
@@ -586,9 +498,9 @@ func TestGappedReferencePFrameSuppressesGOPUntilIDR(t *testing.T) {
 
 	// A new IDR starts a self-contained prediction chain; following P-frames
 	// may then be forwarded normally.
-	c.emit(&pendingFrag{channel: innerChKey, frameNum: 4, totalFrags: 1,
+	fixtureEmit(c, &pendingFrag{channel: innerChKey, frameNum: 4, totalFrags: 1,
 		payload: makeTrailerPayload(idr, true, 1, 1120)})
-	c.emit(&pendingFrag{channel: innerChInter, frameNum: 5, totalFrags: 1,
+	fixtureEmit(c, &pendingFrag{channel: innerChInter, frameNum: 5, totalFrags: 1,
 		payload: makeTrailerPayload(inter, false, 1, 1160)})
 	got := drainAll(c)
 	if len(got) != 2 || !got[0].IsKeyframe || got[1].IsKeyframe {
@@ -807,11 +719,11 @@ func TestRetransmittedKeyframeAssemblesOnCanonicalChannel(t *testing.T) {
 
 func TestExtendedRetransmissionChannelsUseSameMediaSemantics(t *testing.T) {
 	c := newTestClient(0x4000, "sd")
-	audio := []byte{0xff, 0xf1, 0x50, 0x80, 0x01, 0x7f, 0xfc}
+	audio := []byte{0xff, 0xf1, 0x50, 0x80, 0x00, 0xff, 0xfc}
 	c.parseDatagram(makeExtendedPkt(extendedFragSpec{
 		b1: 0x09, channel: innerChRetransAudio, subFlag: 1,
 		subWire: 0x4000, totalFrags: 1, fragIdx: 16,
-		frameNum: 20, mediaFrameNo: 4, payload: audio,
+		frameNum: 20, mediaFrameNo: 4, payload: append(append([]byte(nil), audio...), make([]byte, 16)...),
 	}))
 	video := makeTrailerPayload([]byte{0, 0, 0, 1, 0x61, 0x88}, false, 1, 1040)
 	c.parseDatagram(makeExtendedPkt(extendedFragSpec{
@@ -893,15 +805,6 @@ func TestExtendedMediaRejectDoesNotACK(t *testing.T) {
 	if got := c.stats.extendedMediaRejected.Load(); got != 2 {
 		t.Fatalf("extendedMediaRejected=%d, want 2", got)
 	}
-	if got := c.stats.unknown0c08Remaining.Load(); got != 1 {
-		t.Fatalf("unknown0c08Remaining=%d, want 1", got)
-	}
-	if got := c.stats.unknown0c0dRemaining.Load(); got != 1 {
-		t.Fatalf("unknown0c0dRemaining=%d, want 1", got)
-	}
-	if got := c.stats.sequenceSeenButUnhandled.Load(); got != 2 {
-		t.Fatalf("sequenceSeenButUnhandled=%d, want 2", got)
-	}
 	if got := c.contiguousAckExt(); got != 0x3fff {
 		t.Fatalf("rejected packet advanced ACK watermark to 0x%x", got)
 	}
@@ -909,7 +812,7 @@ func TestExtendedMediaRejectDoesNotACK(t *testing.T) {
 
 func TestExtendedMediaAudioAndVideoRemainContiguous(t *testing.T) {
 	c := newTestClient(0x4000, "sd")
-	audio := []byte{0xff, 0xf1, 0x50, 0x80, 0x01, 0x7f, 0xfc}
+	audio := []byte{0xff, 0xf1, 0x50, 0x80, 0x00, 0xff, 0xfc}
 	video := []byte{0, 0, 0, 1, 0x61, 0x88, 0x99}
 	videoWire := makeTrailerPayload(video, false, 1, 1040)
 
@@ -919,12 +822,12 @@ func TestExtendedMediaAudioAndVideoRemainContiguous(t *testing.T) {
 	c.parseDatagram(makeExtendedPkt(extendedFragSpec{
 		b1: 0x09, channel: innerChAudio, subFlag: 1,
 		subWire: 0x4000, totalFrags: 1, fragIdx: 16,
-		frameNum: 23, mediaFrameNo: 16, payload: audio,
+		frameNum: 23, mediaFrameNo: 16, payload: append(append([]byte(nil), audio...), make([]byte, 16)...),
 	}))
 	c.parseDatagram(makeExtendedPkt(extendedFragSpec{
 		b1: 0x0d, channel: innerChAudio, subFlag: 1,
 		subWire: 0x4001, totalFrags: 1, fragIdx: 16,
-		frameNum: 66, mediaFrameNo: 43, payload: audio,
+		frameNum: 66, mediaFrameNo: 43, payload: append(append([]byte(nil), audio...), make([]byte, 16)...),
 	}))
 	c.parseDatagram(makeExtendedPkt(extendedFragSpec{
 		b1: 0x09, channel: innerChInter, subFlag: 1,
@@ -953,38 +856,6 @@ func TestExtendedMediaAudioAndVideoRemainContiguous(t *testing.T) {
 	}
 }
 
-func TestNormalAudio0c0dIsNotExtended(t *testing.T) {
-	c := newTestClient(0x4000, "hd")
-	payload := append(make([]byte, 8), []byte{0xff, 0xf1, 0x50, 0x80, 0, 0, 0}...)
-	c.parseDatagram(makePkt(fragSpec{
-		channel: innerChInter, sub17: 0, b1: 0x0d,
-		subWire: 0x4000, totalFrags: 1, fragIdx: 0,
-		paylen: uint16(len(payload)), frameNum: 1, payload: payload,
-	}))
-
-	packets := drainAll(c)
-	if len(packets) != 1 || packets[0].Codec != CodecAACADTS {
-		t.Fatalf("normal-layout 0c0d audio packets=%+v", packets)
-	}
-	if got := c.stats.normalMediaPackets.Load(); got != 1 {
-		t.Fatalf("normalMediaPackets=%d, want 1", got)
-	}
-	if got := c.stats.extendedMediaCandidates.Load(); got != 0 {
-		t.Fatalf("extendedMediaCandidates=%d, want 0 for normal AAC", got)
-	}
-}
-
-// TestEndToEndMultiFragmentIDR walks an IDR frame split across 4 data
-// fragments + 1 end fragment through handleIncoming and asserts a
-// single AU is emitted with the concatenated slice bytes.
-//
-// "78 fragments → one IDR AU" is the production case (PLAF203 HD); we
-// scale down to 4+1 for test runtime, but the assembler logic is the
-// same — totalFrags + fragIdx gap detection + trailer-signature
-// end-fragment detection.
-//
-// The transport preserves the trailer's raw camera clock. RTP-clock
-// normalization belongs to the Camera adapter.
 func TestEndToEndMultiFragmentIDR(t *testing.T) {
 	c := newTestClient(0x4000, "hd")
 
@@ -1093,7 +964,7 @@ func TestEndToEndMultiFragmentIDRPreservesCameraTime(t *testing.T) {
 
 // ---------- FRAMEINFO onlineNum handling -------------------------------
 
-// HD quality controls the camera request only. A valid received frame is not
+// HD quality is a readiness preference. A valid received frame is not
 // dropped because its onlineNum differs from a local quality request.
 func TestOnlineNumDoesNotFilterKeyFrames(t *testing.T) {
 	c := newTestClient(0x4000, "hd")
@@ -1460,4 +1331,32 @@ func TestPaylenTruncatesPadding(t *testing.T) {
 	if string(pkts[0].Payload) != string(want) {
 		t.Fatalf("payload=%x, want %x (padding past paylen=4 trimmed)", pkts[0].Payload, want)
 	}
+}
+
+// Sanitized fixtures retain native header structure, not the checksum of
+// private media that was removed. This independently mirrors 3be4f8.
+func fixtureMediaChecksum(inner []byte, off int) {
+	if len(inner) < off+20 {
+		return
+	}
+	var sum uint16
+	for i, b := range inner[off : off+20+int(binary.LittleEndian.Uint16(inner[off+8:]))] {
+		if i == 10 || i == 11 {
+			continue
+		}
+		if i == 0 {
+			if ch, _, ok := normalizeMediaChannel(b); ok {
+				b = ch
+			}
+		}
+		sum += uint16(b)
+	}
+	binary.LittleEndian.PutUint16(inner[off+10:], sum)
+}
+func fixtureEmit(c *Client, p *pendingFrag) {
+	if _, _, _, ok := stripFragmentMetadataTrailer(p.payload); ok {
+		p.isEnd = true
+		p.metadataLen = 16
+	}
+	c.emit(p)
 }

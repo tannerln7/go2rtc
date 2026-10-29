@@ -10,7 +10,9 @@
 //	templates.go  — protocol constants + LOGIN templates + frame builders
 //	client.go     — Client struct + Dial + send/recv helpers + public surface
 //	handshake.go  — LAN_SEARCH3 / KNOCK2 / LOGIN A+B sequencing
-//	bootstrap.go  — post-LOGIN IOCtrl bootstrap (SETSTREAMCTRL → IPCAM_START)
+//	bootstrap.go  — correlated receive-reset → application IOCtrls → START
+//	transport.go  — validated receipt, reliable controls and AV epochs
+//	audio.go      — fragmented AAC assembly and ADTS validation
 //	recv.go       — UDP recv/processor goroutines + maintenance loop + stats
 //	assembler.go  — fragment reassembly (wrapSeq, channelAsm, parseDatagram)
 //	camera.go     — PLAF203 lifecycle/readiness/timestamp normalization adapter
@@ -53,7 +55,7 @@ const (
 )
 
 const (
-	defaultACKInterval = 25 * time.Millisecond
+	defaultACKInterval = 100 * time.Millisecond // native receive-report gate (+0x16cf)
 	// This local bound keeps type-0x09 comfortably below a UDP MTU. If more
 	// holes exist, AVHigh is reduced before the first hole that
 	// cannot be represented, so no missing packet is falsely acknowledged.
@@ -119,29 +121,42 @@ type Client struct {
 	avBuffer  map[uint64]*pendingFrag
 	avNextExt uint64
 	avHighExt uint64
-	// avSequenceAnchored is true once bootstrap or the first runtime video
-	// packet has established the physical session's AV sequence origin.
-	// Some SD sessions retain a camera-global counter instead of restarting at
-	// 0x4000, so a bootstrap with no media cannot always provide that origin.
+	// Only a correlated receive-reset completion establishes an AV epoch.
 	avSequenceAnchored bool
+	avEpochFloor       uint64
+	avFrameFloor       uint32
+	avFrameFloorSet    bool
 	avNextObserved     atomic.Uint64 // synchronized mirror for maintenance ACK diagnostics
 
 	// Receive-side ACK tracking is deliberately independent from the
 	// assembler cursor. forceDrain may skip a missing packet so output
-	// can continue, but only packets actually observed on the wire may
-	// advance ackWatermarkExt.
-	ackMu           sync.Mutex
-	ackReportedExt  uint64 // contiguous position used as +8 in the last successfully sent ACK
-	ackWatermarkExt uint64
-	ackHighExt      uint64
-	ackSeenRanges   []ackSeenRange
-	ackSeenPending  uint64
-	reliableRecvACK uint16
-	reliableRecvSet bool
-	reliableSeen    map[uint16]struct{}
-	ackSendCount    uint16
-	ackGapStarted   time.Time
-	ackPendingWarn  uint64
+	// can continue, but only validated receipt or explicit peer-authorized
+	// discard advances ackWatermarkExt.
+	ackMu             sync.Mutex
+	ackReportedExt    uint64 // contiguous position used as +8 in the last successfully sent ACK
+	ackWatermarkExt   uint64
+	ackHighExt        uint64
+	ackSeenRanges     []ackSeenRange
+	ackSeenPending    uint64
+	reliableRecvACK   uint16
+	reliableRecvSet   bool
+	reliableSeen      map[uint16]struct{}
+	ackSendCount      uint16
+	ackGapStarted     time.Time
+	ackPendingWarn    uint64
+	ackEpoch          uint64 // prevents a pre-reset report committing into the new epoch
+	ackLastSent       time.Time
+	ackForce          bool
+	reliableTX        uint16
+	reliableGroup     uint32
+	reliablePending   map[uint16]*reliableSend
+	reliableRX        map[uint16]reliableFragment
+	reliableBytes     int
+	resetMediaPending []decodedMedia
+	reset             receiveReset
+	peerClear         peerOperation
+	peerReset         peerOperation
+	audioAsm          audioAssembly
 
 	// monotonic counters for outgoing Packets (camera's per-channel
 	// frame_num is independent for the key/inter families, so we use our own)
@@ -737,7 +752,10 @@ func (c *Client) Close() error {
 		if c.mediaStartSent.Swap(false) {
 			stopAttempted = true
 			c.innerMu.Lock()
-			body := innerData(c.icounter, 0x7000, 0, ioctlBody12(ioctlStop))
+			body := innerData(c.icounter, applicationFamily, c.reliableTX, ioctlBody12(ioctlStop))
+			binary.LittleEndian.PutUint32(body[28:], c.reliableGroup)
+			c.reliableTX++
+			c.reliableGroup++
 			c.icounter++
 			c.closeErr = c.sendInner(body)
 			c.innerMu.Unlock()

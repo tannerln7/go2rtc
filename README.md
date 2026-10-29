@@ -91,6 +91,9 @@ ffprobe -v error -rtsp_transport tcp \
   rtsp://127.0.0.1:8554/petlibro_feeder
 ```
 
+`quality=hd` is an HD-readiness preference; `quality=sd` skips that HD wait.
+Neither sends an OEM resolution setter. The feeder's application configuration
+and congestion state select the source; see the [native transport contract](docs/petlibro-transport.md).
 An HD camera may initially send a 640x360 SPS before switching to 1920x1080.
 The PLAF203 adapter automatically gives this transition a bounded 15-second
 preference window before advertising the initial track. This limits startup
