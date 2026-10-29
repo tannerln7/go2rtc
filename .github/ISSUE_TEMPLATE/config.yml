@@ -1,0 +1,6 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Debugging and troubleshooting
+    url: https://github.com/tannerln7/go2rtc/discussions/2
+    about: Ask questions, compare environments, and investigate intermittent or uncertain problems.
+

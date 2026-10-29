@@ -131,10 +131,21 @@ Petlibro Home Assistant add-on releases. Consumers should pin a full commit or
 immutable tag and verify the published checksums rather than tracking the
 `petlibro` branch.
 
-## Troubleshooting and development
+## Support, Issues & Troubleshooting
 
-- [Petlibro debugging guide](docs/debugging.md) — health counters,
-  trace controls, plaintext captures, replay, and common failure modes
+- [Report a reproducible bug](https://github.com/tannerln7/go2rtc/issues/new?template=bug_report.yml)
+  with the structured issue form
+- [Debugging and troubleshooting discussion](https://github.com/tannerln7/go2rtc/discussions/2)
+  for questions, intermittent problems, environment comparisons, and test results
+- [Petlibro debugging guide](docs/debugging.md) for health counters, trace
+  controls, bounded captures, replay, and common failure modes
+
+Use Discussions while the root cause is uncertain. Open an Issue when a defect
+is reproducible or an improvement is clearly scoped, and link any supporting
+discussion. Sanitize logs and configuration before posting.
+
+## Development
+
 - [Development guide](docs/development.md) — package architecture, protocol
   invariants, tests, build checks, and live-test workflow
 - [Contributing](CONTRIBUTING.md) — useful issue evidence, privacy rules, and
