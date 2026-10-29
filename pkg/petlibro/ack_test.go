@@ -362,3 +362,57 @@ func TestBootstrapACKFieldPlacement(t *testing.T) {
 		t.Fatalf("second send counter at +18=%d", got)
 	}
 }
+
+func TestTransportACKAbandonsStaleHole(t *testing.T) {
+	c := newTestClient(101, "hd") // bootstrap/report position is 100
+	c.ackHoleTimeout = 250 * time.Millisecond
+	// 101..103 arrive, 104..106 never do, 107..109 arrive.
+	for _, seq := range []uint64{101, 102, 103, 107, 108, 109} {
+		c.markACKReceived(seq)
+	}
+	a, _ := ackFor(t, c)
+	if a.AVHigh != 109 || !reflect.DeepEqual(a.Missing, []uint16{4, 5, 6}) {
+		t.Fatalf("fresh hole should still be NACKed: ACK=%+v", a)
+	}
+
+	// Age the range above the hole past the timeout.
+	c.ackMu.Lock()
+	c.ackSeenRanges[0].created = time.Now().Add(-time.Second)
+	c.ackMu.Unlock()
+
+	a, w := ackFor(t, c)
+	if a.AVBase != 103 || a.AVHigh != 109 || len(a.Missing) != 0 || w.seenPending != 0 {
+		t.Fatalf("stale hole should be retired without NACK: ACK=%+v window=%+v", a, w)
+	}
+	if got := c.stats.ackHolesAbandoned.Load(); got != 3 {
+		t.Fatalf("ackHolesAbandoned=%d want 3", got)
+	}
+	if c.contiguousAckExt() != 109 {
+		t.Fatalf("watermark=%d want 109", c.contiguousAckExt())
+	}
+
+	// A late retransmit of a skipped packet is treated as old.
+	c.markACKReceived(105)
+	if c.contiguousAckExt() != 109 || c.stats.ackDuplicateOrOld.Load() == 0 {
+		t.Fatal("late retransmit should not disturb the watermark")
+	}
+	// Normal progress resumes.
+	c.markACKReceived(110)
+	if a, _ := ackFor(t, c); a.AVHigh != 110 || len(a.Missing) != 0 {
+		t.Fatalf("ACK after recovery=%+v", a)
+	}
+}
+
+func TestTransportACKHoleTimeoutDisabled(t *testing.T) {
+	c := newTestClient(101, "hd")
+	c.ackHoleTimeout = 0
+	for _, seq := range []uint64{101, 103} {
+		c.markACKReceived(seq)
+	}
+	c.ackMu.Lock()
+	c.ackSeenRanges[0].created = time.Now().Add(-time.Hour)
+	c.ackMu.Unlock()
+	if a, _ := ackFor(t, c); !reflect.DeepEqual(a.Missing, []uint16{2}) {
+		t.Fatalf("disabled timeout must keep NACKing: ACK=%+v", a)
+	}
+}

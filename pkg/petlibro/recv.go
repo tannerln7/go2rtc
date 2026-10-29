@@ -160,6 +160,9 @@ func (c *Client) insertACKSeenLocked(subExt uint64) (inserted, duplicate bool) {
 			r.last = subExt
 			if i+1 < len(c.ackSeenRanges) && r.last+1 == c.ackSeenRanges[i+1].first {
 				r.last = c.ackSeenRanges[i+1].last
+				if c.ackSeenRanges[i+1].created.Before(r.created) {
+					r.created = c.ackSeenRanges[i+1].created
+				}
 				c.ackSeenRanges = append(c.ackSeenRanges[:i+1], c.ackSeenRanges[i+2:]...)
 			}
 			return true, false
@@ -170,14 +173,14 @@ func (c *Client) insertACKSeenLocked(subExt uint64) (inserted, duplicate bool) {
 			}
 			c.ackSeenRanges = append(c.ackSeenRanges, ackSeenRange{})
 			copy(c.ackSeenRanges[i+1:], c.ackSeenRanges[i:])
-			c.ackSeenRanges[i] = ackSeenRange{first: subExt, last: subExt}
+			c.ackSeenRanges[i] = ackSeenRange{first: subExt, last: subExt, created: time.Now()}
 			return true, false
 		}
 	}
 	if len(c.ackSeenRanges) >= maxACKSeenRanges {
 		return false, false
 	}
-	c.ackSeenRanges = append(c.ackSeenRanges, ackSeenRange{first: subExt, last: subExt})
+	c.ackSeenRanges = append(c.ackSeenRanges, ackSeenRange{first: subExt, last: subExt, created: time.Now()})
 	return true, false
 }
 
@@ -254,9 +257,46 @@ func (c *Client) markTransportACKSent(w ackWindow) {
 	c.ackMu.Unlock()
 }
 
+// abandonStaleACKHolesLocked advances the watermark past every hole whose
+// range above it is older than ackHoleTimeout. Skipped positions fall inside
+// the next report's (base, high] without a NACK, which tells the camera to
+// retire them. The caller must hold ackMu.
+func (c *Client) abandonStaleACKHolesLocked(now time.Time) {
+	if c.ackHoleTimeout <= 0 {
+		return
+	}
+	var skipped uint64
+	for len(c.ackSeenRanges) != 0 && now.Sub(c.ackSeenRanges[0].created) >= c.ackHoleTimeout {
+		r := c.ackSeenRanges[0]
+		skipped += r.first - c.ackWatermarkExt - 1
+		c.stats.ackAdvanced.Add(r.last - c.ackWatermarkExt)
+		c.ackSeenPending -= r.last - r.first + 1
+		c.ackWatermarkExt = r.last
+		c.ackSeenRanges = c.ackSeenRanges[1:]
+	}
+	if skipped == 0 {
+		return
+	}
+	c.stats.ackHolesAbandoned.Add(skipped)
+	if c.ackSeenPending == 0 {
+		c.ackGapStarted = time.Time{}
+		c.ackPendingWarn = 32
+	}
+	if c.verbose && c.traceACK {
+		log.Trace().Str("physical_session_id", c.sessionID).
+			Uint64("skipped", skipped).Uint64("watermark", c.ackWatermarkExt).
+			Uint64("pending", c.ackSeenPending).Int("ranges", len(c.ackSeenRanges)).
+			Msg("petlibro ACK holes abandoned")
+	}
+	c.stats.ackWatermark.Store(c.ackWatermarkExt)
+	c.stats.ackSeenPending.Store(c.ackSeenPending)
+	c.stats.ackSeenRanges.Store(uint64(len(c.ackSeenRanges)))
+}
+
 func (c *Client) nextTransportACK(ordinal, tick uint16) (transportACK, ackWindow) {
 	c.ackMu.Lock()
 	defer c.ackMu.Unlock()
+	c.abandonStaleACKHolesLocked(time.Now())
 	w := c.ackWindowLocked()
 	a := c.transportACKLocked(ordinal, uint16(w.baseExt), uint16(w.highExt), w.missing, tick)
 	return a, w
@@ -475,6 +515,7 @@ func (c *Client) dumpStats() {
 			ackTrackingOverflow: cur.ackTrackingOverflow - c.prevStats.ackTrackingOverflow,
 			ackDuplicateOrOld:   cur.ackDuplicateOrOld - c.prevStats.ackDuplicateOrOld,
 			ackAdvanced:         cur.ackAdvanced - c.prevStats.ackAdvanced,
+			ackHolesAbandoned:   cur.ackHolesAbandoned - c.prevStats.ackHolesAbandoned,
 			ackHigh:             cur.ackHigh,
 			ackSent:             cur.ackSent - c.prevStats.ackSent,
 			ackPrevLow16:        cur.ackPrevLow16,
@@ -521,6 +562,7 @@ func (c *Client) dumpStats() {
 		Uint64("video_frames_dropped", delta.vidDropped).Uint64("missing_fragments", delta.missingFragmentsTotal).
 		Uint64("reader_queue_drops", delta.readerDrops).Uint64("output_queue_drops", delta.emitDrops).
 		Uint64("media_retransmissions", delta.mediaRetransmissions).
+		Uint64("ack_holes_abandoned", delta.ackHolesAbandoned).
 		Uint64("ack_pending", cur.ackSeenPending).Uint64("ack_nacks", cur.ackNACKCount).
 		Msg("petlibro transport health")
 	log.Trace().Str("physical_session_id", c.sessionID).Msgf("petlibro transport diagnostics: in=%d pkts (%d KiB) families: key=%d inter=%d audio=%d other=%d | video: %d frames in -> %d out (drop %d) | loss: frames=%d idr=%d p=%d missing=%d maxFrame=%d | frag skips: %d (%d frags lost) | forceDrain: %d | qDrops reader=%d emit=%d | reasons: fragIdxGap=%d frameNumJumpKey=%d frameNumJumpInter=%d expectedDataShortfall=%d zeroDataHardDrop=%d strictIDRDrop=%d strictPDrop=%d gopRecoveryDrop=%d forceDrainFlush=%d forceDrainEntries=%d deferredDrop=%d | mediaHeaders: normal=%d retransmit=%d extendedMedia parsed=%d rejected=%d data=%d end=%d rare=%d unknown0c08=%d unknown0c0d=%d candidates=%d seqAssembled=%d seqUnhandled=%d | frameinfo: codec=0x%04x flag=%d onlineNum=%d changes=%d unexpected=%d | transport: ackRx=%d probeRx=%d responseTx=%d feedbackRx=%d watermark=0x%x high=0x%x avNext=0x%x pending=%d ranges=%d nacks=%d overflow=%d advanced=%d duplicate=%d ackTx=%d base=0x%04x highWire=0x%04x reliable=0x%04x sendCount=0x%04x",

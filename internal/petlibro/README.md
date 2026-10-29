@@ -32,6 +32,7 @@ Core options:
 | `audio` | no | `false` | Requests AAC audio when `true` or `1` |
 | `strict` | no | `false` | Drops damaged IDRs instead of emitting them; reference-P continuity recovery applies in either mode |
 | `verbose` | no | `false` | Enables compact bootstrap, readiness, codec, and health diagnostics |
+| `ack_hole_timeout` | no | `250` | Milliseconds a receive hole is NACKed before it is abandoned and the ACK watermark moves past it; `0` never abandons |
 
 The tracked [`go2rtc.example.yaml`](../../go2rtc.example.yaml) contains a
 recommended PLAF203 configuration. Trace and capture options are documented in the

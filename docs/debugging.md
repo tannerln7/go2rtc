@@ -111,6 +111,13 @@ bounded NACK list cannot describe all holes, so an omitted hole is never
 silently acknowledged. Reliable IOCtrl messages use the separate cumulative
 ACK field recovered from AF203 firmware.
 
+A hole that is still unfilled after `ack_hole_timeout` (250 ms by default) is
+abandoned: the base moves past it without a NACK, so the camera retires those
+packets from its resend queue. Late media is already past the assembler's
+output cursor by then, and a base that never advances makes the PLAF203 slow
+down, drop to 640x360, and eventually stop sending. The `transport health`
+event reports `ack_holes_abandoned` per interval.
+
 With `trace_ack=1`, logs include the extended base/high positions, relative
 NACK offsets, reliable receive ACK, primary ordinal, secondary send counter,
 and low-16 timing value. Normal debug summaries report these as aggregate
