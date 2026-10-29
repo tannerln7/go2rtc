@@ -94,7 +94,7 @@ func (c *Client) bootstrap() error {
 		return err
 	}
 	c.icounter++
-	c.acceptReliableControl(1) // LOGIN's delivered reliable sequence
+	c.acceptReliableControl(initialReliableRecvACK) // next D2C reliable sequence is 0
 	c.initACKTracking(0xffff)
 	if err := c.sendReceiveReport(time.Now()); err != nil {
 		return err

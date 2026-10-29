@@ -11,6 +11,8 @@ import (
 )
 
 const (
+	deviceMagicVersion      byte   = 0x1b
+	initialReliableRecvACK  uint16 = 0xffff
 	controlSenderClear      uint32 = 0x22
 	controlSenderCleared    uint32 = 0x23
 	controlReceiveReset     uint32 = 0x24
@@ -22,7 +24,8 @@ const (
 )
 
 func (c *Client) sessionInner(pkt []byte) ([]byte, bool) {
-	if len(pkt) < 29 || !bytes.Equal(pkt[:3], []byte{4, 2, magicVersion}) || pkt[3] != flagsRecv ||
+	if len(pkt) < 29 || !bytes.Equal(pkt[:2], []byte{4, 2}) ||
+		(pkt[2] != magicVersion && pkt[2] != deviceMagicVersion) || pkt[3] != flagsRecv ||
 		binary.LittleEndian.Uint16(pkt[8:]) != msgSessionD2C {
 		return nil, false
 	}

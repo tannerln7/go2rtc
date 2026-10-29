@@ -526,7 +526,7 @@ func TestNativeBootstrapOverLoopback(t *testing.T) {
 	defer close(finished)
 	go func() {
 		buf := make([]byte, 2048)
-		replySeq := uint16(2)
+		replySeq := uint16(0)
 		dropped := false
 		for {
 			_ = server.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
