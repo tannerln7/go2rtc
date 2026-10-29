@@ -85,6 +85,10 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-dev.') }}
+          # Leave stable releases on the action's existing default behavior.
+          make_latest: ${{ contains(github.ref_name, '-dev.') && 'false' || '' }}
+          body_path: ${{ hashFiles(format('docs/releases/{0}.md', github.ref_name)) != '' && format('docs/releases/{0}.md', github.ref_name) || '' }}
           files: |
             dist/go2rtc_*.tar.gz
             dist/petlibro-go2rtc_linux_*
