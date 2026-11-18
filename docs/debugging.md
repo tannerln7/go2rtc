@@ -101,6 +101,17 @@ bounded NACK list cannot describe all holes, so an omitted hole is never
 silently acknowledged. Reliable IOCtrl messages use the separate cumulative
 ACK field recovered from AF203 firmware.
 
+A hole that is still unfilled after `ack_hole_timeout` (250 ms by default) is
+abandoned: the watermark moves past it without a NACK, so the next report tells
+the camera to retire those packets. The frame they belonged to is already lost
+to a live stream by then. Without this, one packet the camera never resends pins
+the base for the rest of the session; reports are capped at `base + 0xffff`, so
+the session ends once that span is used up (about six minutes at ~220 packets/s
+on a PLAF203). `ack_hole_timeout=0` restores never-skip behavior. With
+`verbose=1`, each abandonment logs `petlibro ACK holes abandoned` at INFO, and
+`transport health` reports `ack_holes_abandoned` per interval. A receive reset
+gives every hole that survives it a fresh timeout.
+
 With `trace_ack=1`, logs include the extended base/high positions, relative
 NACK offsets, reliable receive ACK, primary ordinal, secondary send counter,
 and low-16 timing value. Normal debug summaries report these as aggregate
@@ -121,6 +132,7 @@ progress through the server-side media path:
 | `reader_queue_drops` / `output_queue_drops` | Local receive or assembled-output queue overflow |
 | `missing_fragments` / `dropped_frames` | Transport loss inferred during assembly |
 | `ack_pending` / `ack_nacks` | Current receive backlog and recovery requests |
+| `ack_holes_abandoned` | Missing positions skipped after `ack_hole_timeout` during the interval |
 | `media_stalled` | No media observed during the health interval |
 
 The complete ACK, packet-family, media-header, and assembler counter set remains

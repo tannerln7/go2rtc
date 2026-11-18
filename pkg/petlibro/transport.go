@@ -396,8 +396,13 @@ func (c *Client) discardThrough(floor uint64, frame uint32) {
 			c.ackSeenRanges = c.ackSeenRanges[1:]
 		}
 		c.ackSeenPending = 0
-		for _, r := range c.ackSeenRanges {
+		now := time.Now()
+		for i := range c.ackSeenRanges {
+			r := &c.ackSeenRanges[i]
 			c.ackSeenPending += r.last - r.first + 1
+			// The holes below surviving ranges are re-based on the new floor:
+			// give each a fresh ack_hole_timeout NACK window.
+			r.created = now
 		}
 	}
 	if c.ackReportedExt < floor {

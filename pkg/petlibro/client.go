@@ -64,11 +64,22 @@ const (
 	// common one-hole case stays constant-size. The cap prevents a hostile or
 	// severely reordered stream from creating an unbounded number of ranges.
 	maxACKSeenRanges = 256
+	// Holes older than this are abandoned: the watermark jumps past them so the
+	// camera retires those packets instead of being NACKed for them forever.
+	// Late media is useless to a live stream, and a permanently pinned
+	// watermark caps every later report at base+0xffff, after which the
+	// session dies (~6 min at ~220 packets/s on PLAF203 fw 3.1.48). Override
+	// with ack_hole_timeout=<ms>; 0 restores the never-skip behavior.
+	// Based on PR #1 by ljmerza.
+	defaultACKHoleTimeout = 250 * time.Millisecond
 )
 
 type ackSeenRange struct {
 	first uint64
 	last  uint64
+	// created is when the range was first observed. The hole directly below a
+	// range has existed at least this long.
+	created time.Time
 }
 
 // log is the package-level zerolog instance.  internal/petlibro's
@@ -144,6 +155,7 @@ type Client struct {
 	ackSendCount      uint16
 	ackGapStarted     time.Time
 	ackPendingWarn    uint64
+	ackHoleTimeout    time.Duration
 	ackEpoch          uint64 // prevents a pre-reset report committing into the new epoch
 	ackLastSent       time.Time
 	ackForce          bool
@@ -301,6 +313,7 @@ type counters struct {
 	ackTrackingOverflow atomic.Uint64 // unique positions omitted after the range cap is reached
 	ackDuplicateOrOld   atomic.Uint64 // duplicate or already-contiguously-ACKed AV packets
 	ackAdvanced         atomic.Uint64 // sequence positions by which the receive watermark advanced
+	ackHolesAbandoned   atomic.Uint64 // missing positions skipped after ackHoleTimeout
 	ackHigh             atomic.Uint64 // highest extended AV sequence observed (gauge)
 	ackSent             atomic.Uint64 // maintenance ACK datagrams successfully sent
 	ackPrevLow16        atomic.Uint64 // previous/lower field in the latest maintenance ACK (gauge)
@@ -377,6 +390,7 @@ type countersSnapshot struct {
 	ackTrackingOverflow uint64
 	ackDuplicateOrOld   uint64
 	ackAdvanced         uint64
+	ackHolesAbandoned   uint64
 	ackHigh             uint64
 	ackSent             uint64
 	ackPrevLow16        uint64
@@ -452,6 +466,7 @@ func (c *counters) snapshot() countersSnapshot {
 		ackTrackingOverflow: c.ackTrackingOverflow.Load(),
 		ackDuplicateOrOld:   c.ackDuplicateOrOld.Load(),
 		ackAdvanced:         c.ackAdvanced.Load(),
+		ackHolesAbandoned:   c.ackHolesAbandoned.Load(),
 		ackHigh:             c.ackHigh.Load(),
 		ackSent:             c.ackSent.Load(),
 		ackPrevLow16:        c.ackPrevLow16.Load(),
@@ -598,6 +613,7 @@ func dialTransport(rawURL, quality string, audio bool, correlation cameraCorrela
 		traceFrag:      boolQuery(q, "trace_frag"),
 		traceFrameInfo: boolQuery(q, "trace_frameinfo"),
 		tracePackets:   boolQuery(q, "trace_packets"),
+		ackHoleTimeout: msQuery(q, "ack_hole_timeout", defaultACKHoleTimeout),
 		frames:         make(chan *Packet, 1024),
 		done:           make(chan struct{}),
 		d2cPlainDump:   d2cPlainDump,
@@ -611,7 +627,8 @@ func dialTransport(rawURL, quality string, audio bool, correlation cameraCorrela
 		log.Debug().Str("physical_session_id", c.sessionID).
 			Bool("strict", c.strict).Bool("trace_ack", c.traceACK).
 			Bool("trace_frag", c.traceFrag).Bool("trace_frameinfo", c.traceFrameInfo).
-			Bool("trace_packets", c.tracePackets).Msg("petlibro transport diagnostics configured")
+			Bool("trace_packets", c.tracePackets).Dur("ack_hole_timeout", c.ackHoleTimeout).
+			Msg("petlibro transport diagnostics configured")
 	}
 	log.Debug().Str("physical_session_id", c.sessionID).Msg("petlibro handshake started")
 	if err := c.handshake(); err != nil {
@@ -653,6 +670,26 @@ func boolQuery(q url.Values, key string) bool {
 	}
 	b, _ := strconv.ParseBool(v)
 	return b
+}
+
+// maxQueryMS bounds millisecond query values so the conversion cannot
+// overflow time.Duration into a negative (= disabled) value.
+const maxQueryMS = 600_000
+
+// msQuery parses a millisecond duration in [0, maxQueryMS], falling back to
+// def (with a warning) when the value is invalid or out of range.
+func msQuery(q url.Values, key string, def time.Duration) time.Duration {
+	v := q.Get(key)
+	if v == "" {
+		return def
+	}
+	ms, err := strconv.Atoi(v)
+	if err != nil || ms < 0 || ms > maxQueryMS {
+		log.Warn().Str("key", key).Str("value", v).Dur("default", def).
+			Msg("petlibro invalid millisecond option, using default")
+		return def
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 // --- I/O helpers (use pkg/tutk for the luffy crypto) ----------------------
