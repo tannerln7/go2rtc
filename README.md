@@ -14,7 +14,7 @@ end-to-end. This project is not affiliated with Petlibro or TUTK.
 - A Petlibro camera that has completed initial Wi-Fi provisioning in the Petlibro app
 - The camera's 20-character UID
 - Network access from the go2rtc host to the camera on UDP port `32761`
-- [Go 1.24 or newer](https://go.dev/doc/install) for a source build
+- [Go 1.26 or newer](https://go.dev/doc/install) for a source build
 - FFmpeg or ffprobe only if you want command-line stream verification
 
 ## Install from source

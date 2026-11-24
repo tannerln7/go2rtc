@@ -90,7 +90,7 @@ func Init() {
 }
 
 func InitEmbedded(configYAML string) {
-	Version = "1.9.14"
+	Version = "1.9.15"
 	UserAgent = "go2rtc/" + Version
 
 	Info["version"] = Version

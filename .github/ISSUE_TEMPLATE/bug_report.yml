@@ -56,7 +56,7 @@ body:
       label: go2rtc environment
       description: Include the go2rtc release/tag or commit, installation method, OS/architecture, and relevant streaming consumer.
       placeholder: |
-        go2rtc: v1.9.14-petlibro.3
+        go2rtc: v1.9.15-petlibro.1
         Installation: Home Assistant add-on
         OS/architecture: Home Assistant OS, amd64
         Consumer: WebRTC in Home Assistant

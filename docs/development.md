@@ -7,7 +7,7 @@ go2rtc architecture and APIs, use the existing module documentation under
 
 ## Toolchain
 
-- Go 1.24 or newer, as declared by [`go.mod`](../go.mod)
+- Go 1.26 or newer, as declared by [`go.mod`](../go.mod)
 - Git
 - FFmpeg/ffprobe for optional RTSP verification
 
